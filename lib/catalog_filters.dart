@@ -1,0 +1,253 @@
+import 'package:flutter/material.dart';
+
+import 'app_layout.dart';
+import 'category_levels.dart';
+import 'compact_chip.dart';
+import 'models.dart';
+import 'remote_widgets.dart';
+
+class CatalogFilters extends StatefulWidget {
+  const CatalogFilters({
+    super.key,
+    required this.categories,
+    required this.category,
+    required this.onCategory,
+    required this.onRetry,
+    this.error,
+    this.trailing,
+    this.remoteKey,
+    this.remoteAutofocus = false,
+    this.onExitUp,
+    this.onExitDown,
+  });
+
+  final List<CatalogCategory> categories;
+  final String category;
+  final String? error;
+  final ValueChanged<String> onCategory;
+  final VoidCallback onRetry;
+  final Widget? trailing;
+  final GlobalKey<RemoteRowState>? remoteKey;
+  final bool remoteAutofocus;
+  final VoidCallback? onExitUp;
+  final VoidCallback? onExitDown;
+
+  @override
+  State<CatalogFilters> createState() => _CatalogFiltersState();
+}
+
+class _CatalogFiltersState extends State<CatalogFilters> {
+  final _anchors = <String, GlobalKey>{};
+
+  int get _selectedIndex {
+    final index = widget.categories.indexWhere(
+      (entry) => entry.id == widget.category,
+    );
+    return index < 0 ? 0 : index;
+  }
+
+  @override
+  void didUpdateWidget(covariant CatalogFilters oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.category != widget.category) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final anchor = _anchors[widget.category]?.currentContext;
+        if (mounted && anchor != null) {
+          Scrollable.ensureVisible(
+            anchor,
+            alignment: .4,
+            duration: const Duration(milliseconds: 180),
+          );
+        }
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final television = AppLayout.isTelevision(context);
+    // 电视遥控路径保持单排：焦点在 RemoteRow 内左右走，分两排会
+    // 打乱上下焦点链；手机/平板路径按两级分两排。
+    if (television) {
+      return SizedBox(
+        height: 64,
+        child: Row(children: [_remoteRow(), _errorButton(), _trailing()]),
+      );
+    }
+    final levels = splitCategoryLevels(widget.categories);
+    final rows = [
+      levels.level1,
+      if (levels.level2.isNotEmpty) levels.level2,
+    ];
+    final chipHeight = compactChipHeight(context);
+    final heights = <double>[
+      largeCompactChipHeight(context),
+      for (var i = 1; i < rows.length; i++) chipHeight,
+    ];
+    final totalHeight =
+        heights.fold<double>(0, (sum, h) => sum + h) +
+        (rows.length > 1 ? 4 : 0);
+    return SizedBox(
+      height: totalHeight,
+      child: Column(
+        children: [
+          for (var i = 0; i < rows.length; i++) ...[
+            if (i > 0) const SizedBox(height: 4),
+            SizedBox(
+              height: heights[i],
+              child: Row(
+                children: [
+                  Expanded(child: _chipRow(i, rows[i])),
+                  if (i == 0) ...[_errorButton(), _trailing()],
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _errorButton() {
+    if (widget.error == null) return const SizedBox.shrink();
+    return IconButton(
+      tooltip: widget.error,
+      onPressed: widget.onRetry,
+      icon: Icon(
+        Icons.refresh_rounded,
+        color: Theme.of(context).colorScheme.error,
+      ),
+    );
+  }
+
+  Widget _trailing() => widget.trailing ?? const SizedBox.shrink();
+
+  Widget _remoteRow() {
+    return Expanded(
+      child: RemoteRow(
+        key: widget.remoteKey,
+        itemKeys: [for (final entry in widget.categories) entry.id],
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        initialIndex: _selectedIndex,
+        autofocus: widget.remoteAutofocus,
+        onExitUp: widget.onExitUp,
+        onExitDown: widget.onExitDown,
+        itemBuilder: (_, index, node, onFocus) {
+          final entry = widget.categories[index];
+          return KeyedSubtree(
+            key: _anchors.putIfAbsent(entry.id, GlobalKey.new),
+            child: RemoteButton(
+              key: ValueKey('category-${entry.id}'),
+              label: entry.name,
+              selected: entry.id == widget.category,
+              focusNode: node,
+              onFocus: onFocus,
+              onPressed: () => widget.onCategory(entry.id),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _chipRow(int rowIndex, List<CatalogCategory> entries) {
+    return SingleChildScrollView(
+      key: ValueKey('catalog-categories-$rowIndex'),
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 8),
+      child: Row(
+        children: [
+          for (final entry in entries)
+            Padding(
+              key: _anchors.putIfAbsent(entry.id, GlobalKey.new),
+              padding: const EdgeInsets.only(right: 3),
+              child: CompactFilterChip(
+                key: ValueKey('category-${entry.id}'),
+                label: entry.name,
+                selected: entry.id == widget.category,
+                large: rowIndex == 0,
+                onSelected: () => widget.onCategory(entry.id),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class CatalogFilterRows extends StatelessWidget {
+  const CatalogFilterRows({
+    super.key,
+    required this.groups,
+    required this.selected,
+    required this.onSelected,
+  });
+
+  final List<CatalogFilterGroup> groups;
+  final Map<String, String> selected;
+  final void Function(String groupKey, String optionId) onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        for (var i = 0; i < groups.length; i++) ...[
+          if (i > 0) const SizedBox(height: 4),
+          SizedBox(
+            height: compactChipHeight(context),
+            child: Row(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(left: 8, right: 3),
+                  child: SizedBox(
+                    width: 19,
+                    child: Text(
+                      groups[i].name,
+                      style: TextStyle(
+                        fontSize: 8,
+                        fontWeight: FontWeight.w600,
+                        color: scheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                ),
+                Expanded(
+                  child: ListView(
+                    scrollDirection: Axis.horizontal,
+                    padding: const EdgeInsets.only(right: 8),
+                    children: [
+                      _chip(context, groups[i], '', '全部'),
+                      for (final option in groups[i].options)
+                        _chip(context, groups[i], option.id, option.name),
+                    ],
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+        const SizedBox(height: 6),
+      ],
+    );
+  }
+
+  Widget _chip(
+    BuildContext context,
+    CatalogFilterGroup group,
+    String id,
+    String label,
+  ) {
+    final isSelected = (selected[group.key] ?? '') == id;
+    return Padding(
+      padding: const EdgeInsets.only(right: 3),
+      child: CompactFilterChip(
+        key: ValueKey('filter-${group.key}-$id'),
+        label: label,
+        selected: isSelected,
+        onSelected: () => onSelected(group.key, id),
+      ),
+    );
+  }
+}

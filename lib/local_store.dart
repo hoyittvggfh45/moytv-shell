@@ -1,0 +1,1733 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+
+import 'package:flutter/foundation.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+import 'app_database.dart';
+import 'app_theme_config.dart';
+import 'content_registry.dart';
+import 'core_bridge.dart';
+import 'custom_headers.dart';
+import 'jar_import.dart';
+import 'json_list_import.dart';
+import 'imported_site_record.dart';
+import 'live_models.dart';
+import 'live_sources.dart';
+import 'local_profiles.dart';
+import 'local_snapshot.dart';
+import 'm3u_subscriptions.dart';
+import 'models.dart';
+import 'tvbox_config.dart';
+import 'intro_outro_skip.dart';
+import 'playback_preferences.dart';
+import 'download_preferences.dart';
+import 'catalog_sort.dart';
+import 'follow_state.dart';
+import 'hongguo_series.dart';
+import 'site_health.dart';
+import 'xigua/watch_stats.dart';
+
+class LocalStore extends ChangeNotifier {
+  LocalStore(this.preferences) {
+    _m3uLoader = loadM3uChannels;
+    loadImportedLiveChannels = _m3uLoader;
+    _initialize();
+    _registerSiteHealth();
+  }
+
+  /// 站点健康学习门面注册：把已存记录载入单例、挂延迟落盘回调
+  /// 与总开关初值。放构造里做，main.dart 不用改。
+  void _registerSiteHealth() {
+    final health = SiteHealthStore.instance;
+    health.loadFromJson(_string('site_health_v1'));
+    health.enabled = siteHealthEnabled;
+    health.onSave = (json) {
+      unawaited(setSiteHealthJson(json).catchError((_) {}));
+    };
+  }
+
+  /// 直播仓库按需加载 m3u 频道时走的加载器（见 loadM3uChannels）。
+  late final ImportedLiveChannelsLoader _m3uLoader;
+
+  final SharedPreferences preferences;
+  LocalSnapshot? _snapshot;
+  final Map<String, WatchEntry> _history = {};
+  final Map<String, Drama> _favorites = {};
+  final Map<String, FollowState> _followStates = {};
+  final Map<String, Drama> _seriesCandidates = {};
+  Future<void> _writes = Future<void>.value();
+  List<LocalProfile> _profiles = [];
+  String _current = 'default';
+  bool _locked = false;
+  bool _disposed = false;
+  String? _configurationError;
+  int _epoch = 0;
+  int _failures = 0;
+  DateTime _retryAfter = DateTime(2000);
+  List<CustomSourceSite> _customSources = [];
+  List<ImportedSiteRecord> _importedSiteRecords = [];
+  final Set<String> _registeredImportIds = {};
+  List<M3uSubscription> _m3uSubscriptions = [];
+  final Set<String> _registeredM3uIds = {};
+
+  /// 订阅双入口的待办请求（内存态，不落盘）：订阅行点“影视/直播”后
+  /// 记下要进的站源 id 或直播源 id，首页在 didPopNext 里消费后清掉。
+  /// 两个方向互斥，后一次请求覆盖前一次。
+  String _pendingLiveSourceId = '';
+  String _pendingVideoSiteId = '';
+  String get pendingLiveSourceId => _pendingLiveSourceId;
+  String get pendingVideoSiteId => _pendingVideoSiteId;
+
+  void requestSubscriptionEntry({
+    String liveSourceId = '',
+    String siteId = '',
+  }) {
+    _pendingLiveSourceId = liveSourceId;
+    _pendingVideoSiteId = siteId;
+    _notify();
+  }
+
+  void clearSubscriptionEntryRequest() {
+    if (_pendingLiveSourceId.isEmpty && _pendingVideoSiteId.isEmpty) return;
+    _pendingLiveSourceId = '';
+    _pendingVideoSiteId = '';
+    _notify();
+  }
+
+  void _initialize() {
+    try {
+      _snapshot = LocalSnapshot(preferences);
+    } catch (_) {
+      _snapshot = LocalSnapshot.migrated(preferences);
+    }
+    try {
+      _loadCustomSources();
+      TvBoxConfigStore.restore(preferences);
+      JarImport.restore(preferences);
+      _loadImportedSites();
+      _loadM3uSubscriptions();
+    } catch (_) {}
+    try {
+      final raw = _snapshot!.getString('profiles');
+      _profiles = raw == null
+          ? [const LocalProfile(id: 'default', name: '管理员', admin: true)]
+          : _readProfiles(jsonDecode(raw));
+      _current = _snapshot!.getString('activeProfile') ?? 'default';
+      if (!_profiles.any((profile) => profile.id == _current)) {
+        _current = _profiles.firstWhere((profile) => profile.admin).id;
+      }
+    } catch (_) {
+      _profiles = [const LocalProfile(id: 'default', name: '管理员', admin: true)];
+      _current = 'default';
+    }
+    _configurationError = null;
+    try {
+      _loadLibrary();
+    } catch (_) {
+      _history.clear();
+      _favorites.clear();
+      _followStates.clear();
+      _seriesCandidates.clear();
+    }
+  }
+
+  static List<LocalProfile> _readProfiles(dynamic records) {
+    final profiles = (records as List)
+        .map(
+          (row) => LocalProfile.fromJson(Map<String, dynamic>.from(row as Map)),
+        )
+        .toList();
+    if (profiles.isEmpty ||
+        profiles.length > 20 ||
+        profiles.map((profile) => profile.id).toSet().length !=
+            profiles.length ||
+        profiles.where((profile) => profile.admin).length != 1 ||
+        (profiles.length > 1 &&
+            !profiles.firstWhere((profile) => profile.admin).protected)) {
+      throw const FormatException('用户配置无效');
+    }
+    return profiles;
+  }
+
+  void _block(String message) {
+    _configurationError = message;
+    _locked = true;
+    _profiles = [
+      const LocalProfile(id: 'default', name: '配置待恢复', download: false),
+    ];
+    _current = 'default';
+    _history.clear();
+    _favorites.clear();
+    _followStates.clear();
+    _seriesCandidates.clear();
+    _epoch++;
+  }
+
+  void _notify() {
+    if (!_disposed) notifyListeners();
+  }
+
+  String? _string(String key) => _snapshot?.getString(key);
+  bool? _bool(String key) => _snapshot?.getBool(key);
+  String _key(String key, [String? id]) =>
+      (id ?? _current) == 'default' ? key : 'profile.${id ?? _current}.$key';
+  String? get configurationError => _configurationError;
+  List<LocalProfile> get profiles => List.unmodifiable(_profiles);
+  LocalProfile get profile =>
+      _profiles.firstWhere((profile) => profile.id == _current);
+  bool get locked => _locked || _configurationError != null;
+  int get profileEpoch => _epoch;
+
+  bool get canDownload => !locked && (profile.admin || profile.download);
+  WatchStats get watchStats {
+    if (locked) return const WatchStats();
+    try {
+      return WatchStats.fromJson(
+        jsonDecode(_string(_key('watchStats')) ?? '{}'),
+      );
+    } catch (_) {
+      return const WatchStats();
+    }
+  }
+
+  bool allowsSource(String source) {
+    if (locked) return false;
+    if (!SourceSite.isAvailable(source)) return false;
+    // 自定义源为设备级功能，管理员与普通用户均可使用。
+    if (SourceSite.isCustomId(source)) return true;
+    if (SourceSite.importedSites.containsKey(source)) return true;
+    // 网盘站源为设备级功能：登录本身就是门禁，管理员与普通用户均可使用。
+    if (SourceSite.cloudDriveSites.containsKey(source)) return true;
+    return profile.allows(source);
+  }
+
+  List<SourceSite> get sources {
+    final builtIn = SourceSite.values.where((site) => allowsSource(site.id));
+    final custom = _customSources
+        .where((site) => allowsSource(site.id))
+        .where((site) => !SourceSite.importedSites.containsKey(site.id))
+        .map((site) => site.asSourceSite);
+    final imported = SourceSite.importedSites.values.where(
+      (site) => allowsSource(site.id),
+    );
+    final cloudDrives = SourceSite.cloudDriveSites.values.where(
+      (site) => allowsSource(site.id),
+    );
+    return [...builtIn, ...custom, ...imported, ...cloudDrives];
+  }
+
+  /// 当前用户被隐藏、不首页显示的站源 id 集合（含内置与自定义站源）。
+  /// 从未在「源显示列表」里配置过时，落到内置默认隐藏集
+  /// （默认可见：红果、韩小圈、鬼片、A123、爱看机器人），
+  /// 用户配置过则以存档值为准。
+  Set<String> get hiddenSites {
+    if (locked) return const {};
+    return _effectiveHiddenSites(_current);
+  }
+
+  Set<String> _effectiveHiddenSites(String profileId) {
+    final raw = _string(_key('hiddenSites', profileId));
+    if (raw == null) {
+      // 从未在「源显示列表」里配置过（新用户）：落到内置默认隐藏集。
+      return Set<String>.of(SourceSite.defaultHiddenSiteIds);
+    }
+    try {
+      final stored = jsonDecode(raw);
+      if (stored is List) {
+        // 用户配置过（含手动设为全部可见的空列表）：以存档值为准。
+        return stored.whereType<String>().toSet();
+      }
+    } catch (_) {}
+    // 存档损坏：同样落到默认隐藏集，避免退化为全可见。
+    return Set<String>.of(SourceSite.defaultHiddenSiteIds);
+  }
+
+  bool siteVisible(String source) => !hiddenSites.contains(source);
+
+  /// 首页与各站源分组消费的可见站源列表。
+  List<SourceSite> get visibleSources {
+    final hidden = hiddenSites;
+    return sources.where((site) => !hidden.contains(site.id)).toList();
+  }
+
+  Future<void> setSiteVisible(String source, bool visible) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      if (!SourceSite.isKnown(source) && !ContentRegistry.isKnownId(source)) {
+        throw StateError('未知站源');
+      }
+      final next = Set<String>.of(hiddenSites);
+      if (visible) {
+        next.remove(source);
+      } else {
+        next.add(source);
+      }
+      await _commit({_key('hiddenSites'): jsonEncode(next.toList())});
+      _notify();
+    });
+  }
+
+  Set<String> get expandedSourceGroups {
+    if (locked) return const {};
+    final raw = _string(_key('expandedSourceGroups'));
+    if (raw == null) return const {};
+    try {
+      final stored = jsonDecode(raw);
+      if (stored is! List) return const {};
+      return stored.whereType<String>().toSet();
+    } catch (_) {
+      return const {};
+    }
+  }
+
+  Future<void> setExpandedSourceGroups(Set<String> ids) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      await _commit({_key('expandedSourceGroups'): jsonEncode(ids.toList())});
+      _notify();
+    });
+  }
+
+  Future<void> resetSiteVisibility() {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      await _commit({
+        _key('hiddenSites'): jsonEncode(
+          SourceSite.defaultHiddenSiteIds.toList(),
+        ),
+      });
+      _notify();
+    });
+  }
+
+  List<CustomSourceSite> get customSources => List.unmodifiable(_customSources);
+
+  void _loadCustomSources() {
+    try {
+      _customSources = [
+        for (final row in readJsonList(_string('customSources')))
+          CustomSourceSite.fromJson(row),
+      ];
+    } catch (_) {
+      _customSources = [];
+    }
+    _syncCustomIds();
+  }
+
+  void _syncCustomIds() {
+    SourceSite.customIds
+      ..clear()
+      ..addAll(_customSources.map((site) => site.id));
+  }
+
+  /// 将设备端已保存的自定义源替换为最新结果并持久化。
+  Future<void> syncCustomSources(List<CustomSourceSite> sources) async {
+    final epoch = _epoch;
+    await _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final sorted = List<CustomSourceSite>.of(sources)
+        ..sort((a, b) {
+          final la = a.name.toLowerCase(), lb = b.name.toLowerCase();
+          return la.compareTo(lb);
+        });
+      final serialized = jsonEncode(
+        sorted.map((site) => site.toJson()).toList(),
+      );
+      if (serialized == _string('customSources')) {
+        _customSources = sorted;
+        _syncCustomIds();
+        return;
+      }
+      await _commit({'customSources': serialized});
+      _customSources = sorted;
+      _syncCustomIds();
+      _notify();
+    });
+  }
+
+  Future<void> persistCustomSources(List<CustomSourceSite> sources) =>
+      syncCustomSources(sources);
+
+  List<ImportedSiteRecord> get importedSiteRecords =>
+      List.unmodifiable(_importedSiteRecords);
+
+  void _loadImportedSites() {
+    try {
+      _importedSiteRecords =
+          [
+                for (final row in readJsonList(_string('importedSites')))
+                  ImportedSiteRecord.fromJson(row),
+              ]
+              .where((record) => record.id.isNotEmpty && record.type.isNotEmpty)
+              .toList();
+    } catch (_) {
+      _importedSiteRecords = [];
+    }
+    // 启动即按同名序号口径重算一遍显示名（只改内存，落盘等下次
+    // syncImportedSites 自然带上），保证重启前后同名组编号一致。
+    _importedSiteRecords = renumberImportedSiteRecords(_importedSiteRecords);
+    _syncImportedRegistry();
+  }
+
+  void _syncImportedRegistry() {
+    for (final id in _registeredImportIds) {
+      SourceSite.importedSites.remove(id);
+      SourceSite.importedPyFiles.remove(id);
+      SourceSite.importedJsFiles.remove(id);
+      SourceSite.importedHtmlFiles.remove(id);
+    }
+    _registeredImportIds.clear();
+    for (final record in _importedSiteRecords) {
+      if (!record.enabled) continue;
+      SourceSite.importedSites[record.id] = record.asSite;
+      _registeredImportIds.add(record.id);
+      if (record.type == ImportedSiteRecord.typePy ||
+          record.type == ImportedSiteRecord.typeJsonList) {
+        SourceSite.importedPyFiles[record.id] = record.fileName;
+      }
+      if (record.type == ImportedSiteRecord.typeJs) {
+        SourceSite.importedJsFiles[record.id] = record.fileName;
+      }
+      if (record.type == ImportedSiteRecord.typeHtml) {
+        SourceSite.importedHtmlFiles[record.id] = record.fileName;
+      }
+    }
+  }
+
+  /// 插件安装/卸载后通知：站点登记表已变，各处站点列表立即重算。
+  /// 只发通知，不重建登记表（登记表由安装/卸载路径直接维护）。
+  void refreshSiteRegistry() => _notify();
+
+  Future<void> syncImportedSites(List<ImportedSiteRecord> input) async {
+    // 全部增删入口（导入引擎、导入中心删除、站点导入流、插件市场、
+    // 首页）最终都经这里落盘，先统一重排同名序号：同名组按基准名
+    // 编号、删后自动重排、剩一条回原名，各入口不用各自挂逻辑。
+    final records = renumberImportedSiteRecords(input);
+    final epoch = _epoch;
+    await _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final serialized = jsonEncode(
+        records.map((record) => record.toJson()).toList(),
+      );
+      if (serialized != _string('importedSites')) {
+        await _commit({'importedSites': serialized});
+      }
+      _importedSiteRecords = List.of(records);
+      _syncImportedRegistry();
+      _notify();
+    });
+  }
+
+  List<M3uSubscription> get m3uSubscriptions =>
+      List.unmodifiable(_m3uSubscriptions);
+
+  void _loadM3uSubscriptions() {
+    try {
+      _m3uSubscriptions = [
+        for (final row in readJsonList(_string('m3uSubscriptions')))
+          M3uSubscription.fromJson(row),
+      ].where((sub) => sub.id.isNotEmpty).toList();
+    } catch (_) {
+      _m3uSubscriptions = [];
+    }
+    _syncM3uRegistry();
+    _shrinkM3uSnapshotIfNeeded();
+  }
+
+  /// 老快照瘦身：旧版快照里含 channels，一次性重写为元数据版，
+  /// 否则旧的大快照会一直占着 16MB 额度，其他提交也跟着报错。
+  /// 只在内容确实变了时写一次；写失败也不影响使用。
+  void _shrinkM3uSnapshotIfNeeded() {
+    final stored = _string('m3uSubscriptions');
+    if (stored == null) return;
+    final slim = jsonEncode(
+      _m3uSubscriptions.map((sub) => sub.toJson()).toList(),
+    );
+    if (slim == stored) return;
+    unawaited(
+      _queue(() async {
+        if (locked) return;
+        try {
+          await _commit({'m3uSubscriptions': slim});
+        } catch (_) {}
+      }),
+    );
+  }
+
+  void _syncM3uRegistry() {
+    for (final sourceId in _registeredM3uIds) {
+      LiveSource.importedSources.remove(sourceId);
+      importedLiveChannels.remove(sourceId);
+    }
+    _registeredM3uIds.clear();
+    for (final sub in _m3uSubscriptions) {
+      LiveSource.importedSources[sub.sourceId] = LiveSource(
+        id: sub.sourceId,
+        name: sub.name,
+        description: 'm3u 导入 · ${sub.channelCount} 个频道',
+        protocol: LiveProtocol.list,
+        builtin: false,
+        epg: sub.epg,
+      );
+      // 只注册已加载在内存里的频道；没加载的订阅不在表里，
+      // 直播页点开时仓库走按需加载器读本地副本重解析。
+      if (sub.channels.isNotEmpty) {
+        importedLiveChannels[sub.sourceId] = sub.channels;
+      }
+      _registeredM3uIds.add(sub.sourceId);
+    }
+  }
+
+  /// 按需加载某 m3u 订阅的频道（直播页点开该源时由仓库调起）。
+  /// 内存里只留一个订阅的频道：加载新订阅时，把其他有本地副本
+  /// （可重解析）的订阅的内存频道丢掉；无副本的订阅（仅内存有
+  /// 频道）不丢，那是它唯一的份。force 时重读文件。
+  Future<List<LiveChannel>> loadM3uChannels(
+    String sourceId, {
+    bool force = false,
+  }) async {
+    var result = const <LiveChannel>[];
+    await _queue(() async {
+      if (locked) throw AppFailure('当前配置未恢复，无法加载订阅频道');
+      final index = _m3uSubscriptions.indexWhere(
+        (sub) => sub.sourceId == sourceId,
+      );
+      if (index < 0) throw AppFailure('订阅不存在或已被删除');
+      final sub = _m3uSubscriptions[index];
+      if (!force && sub.channels.isNotEmpty) {
+        result = sub.channels;
+        return;
+      }
+      final loaded = await M3uSubscriptionService.loadChannels(
+        sub,
+        force: force,
+      );
+      result = loaded;
+      _m3uSubscriptions = [
+        for (final item in _m3uSubscriptions)
+          if (item.id == sub.id)
+            item.copyWith(channels: loaded, channelCount: loaded.length)
+          else if (item.fileName.isNotEmpty && item.channels.isNotEmpty)
+            item.copyWith(channels: const [])
+          else
+            item,
+      ];
+      _syncM3uRegistry();
+    });
+    return result;
+  }
+
+  Future<void> syncM3uSubscriptions(List<M3uSubscription> subscriptions) async {
+    final epoch = _epoch;
+    await _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final serialized = jsonEncode(
+        subscriptions.map((sub) => sub.toJson()).toList(),
+      );
+      if (serialized != _string('m3uSubscriptions')) {
+        await _commit({'m3uSubscriptions': serialized});
+      }
+      // 频道只留内存一份：有本地副本的订阅（可按需重解析）立即
+      // 丢掉内存频道，避免连续导入 9 份大文件时 30 万条频道全
+      // 挤在内存；无副本的订阅保留内存频道，那是它唯一的份。
+      _m3uSubscriptions = [
+        for (final sub in subscriptions)
+          if (sub.fileName.isNotEmpty && sub.channels.isNotEmpty)
+            sub.copyWith(channels: const [])
+          else
+            sub,
+      ];
+      _syncM3uRegistry();
+      _notify();
+    });
+  }
+
+  void _loadLibrary() {
+    _history.clear();
+    _favorites.clear();
+    _followStates.clear();
+    _seriesCandidates.clear();
+    if (_configurationError != null) return;
+    for (final row in readJsonList(_string(_key('history')))) {
+      try {
+        final entry = WatchEntry.fromJson(row);
+        _history[entry.drama.id] = entry;
+      } catch (_) {}
+    }
+    for (final row in readJsonList(_string(_key('favorites')))) {
+      try {
+        final drama = Drama.fromJson(row);
+        _favorites[drama.id] = drama;
+      } catch (_) {}
+    }
+    Map<String, dynamic> states = {};
+    try {
+      states = Map<String, dynamic>.from(
+        jsonDecode(_string(_key('followStates')) ?? '{}') as Map,
+      );
+    } catch (_) {}
+    for (final drama in _favorites.values) {
+      try {
+        _followStates[drama.id] = FollowState.fromJson(
+          Map<String, dynamic>.from(states[drama.id] as Map),
+        );
+      } catch (_) {
+        _followStates[drama.id] = FollowState.initial(
+          drama,
+          _history[drama.id],
+        );
+      }
+    }
+    for (final row in readJsonList(_string(_key('seriesCandidates')))) {
+      try {
+        final drama = Drama.fromJson(row);
+        if (drama.source == SourceSite.hongguo.id) {
+          _seriesCandidates[drama.id] = drama;
+        }
+      } catch (_) {}
+    }
+  }
+
+  (String, String)? _libraryKeyProfile(String key) {
+    if (key == 'history') return ('default', 'history');
+    if (key == 'favorites') return ('default', 'favorites');
+    final parts = key.split('.');
+    if (parts.length == 3 &&
+        parts[0] == 'profile' &&
+        (parts[2] == 'history' || parts[2] == 'favorites')) {
+      return (parts[1], parts[2]);
+    }
+    return null;
+  }
+
+  Future<void> _syncLibraryKeysToDb(
+    Map<String, Object> changes,
+    Iterable<String> remove,
+  ) async {
+    final db = AppDatabase.instance;
+    final historyByProfile = <String, List<WatchEntry>>{};
+    final favoritesByProfile = <String, List<Drama>>{};
+    for (final key in changes.keys) {
+      final parsed = _libraryKeyProfile(key);
+      if (parsed == null) continue;
+      final raw = changes[key];
+      if (raw is! String) continue;
+      if (parsed.$2 == 'history') {
+        final entries = <WatchEntry>[];
+        for (final row in readJsonList(raw)) {
+          try {
+            entries.add(WatchEntry.fromJson(row));
+          } catch (_) {}
+        }
+        historyByProfile[parsed.$1] = entries;
+      } else {
+        final dramas = <Drama>[];
+        for (final row in readJsonList(raw)) {
+          try {
+            dramas.add(Drama.fromJson(row));
+          } catch (_) {}
+        }
+        favoritesByProfile[parsed.$1] = dramas;
+      }
+    }
+    for (final key in remove) {
+      if (changes.containsKey(key)) continue;
+      final parsed = _libraryKeyProfile(key);
+      if (parsed == null) continue;
+      if (parsed.$2 == 'history') {
+        historyByProfile[parsed.$1] = const [];
+      } else {
+        favoritesByProfile[parsed.$1] = const [];
+      }
+    }
+    for (final entry in historyByProfile.entries) {
+      await db.replaceHistory(entry.key, entry.value);
+    }
+    for (final entry in favoritesByProfile.entries) {
+      await db.replaceFavorites(entry.key, entry.value);
+    }
+  }
+
+  Future<void> _syncLibraryFromDbLocked() async {
+    if (_configurationError != null) return;
+    try {
+      final db = AppDatabase.instance;
+      if (await db.isSynced(_current)) {
+        final history = await db.loadHistory(_current);
+        final favorites = await db.loadFavorites(_current);
+        _history.clear();
+        for (final entry in history) {
+          _history[entry.drama.id] = entry;
+        }
+        _favorites.clear();
+        for (final drama in favorites) {
+          _favorites[drama.id] = drama;
+        }
+        Map<String, dynamic> states = {};
+        try {
+          states = Map<String, dynamic>.from(
+            jsonDecode(_string(_key('followStates')) ?? '{}') as Map,
+          );
+        } catch (_) {}
+        _followStates.clear();
+        for (final drama in _favorites.values) {
+          try {
+            _followStates[drama.id] = FollowState.fromJson(
+              Map<String, dynamic>.from(states[drama.id] as Map),
+            );
+          } catch (_) {
+            _followStates[drama.id] = FollowState.initial(
+              drama,
+              _history[drama.id],
+            );
+          }
+        }
+        _notify();
+      } else {
+        await db.replaceHistory(_current, _history.values);
+        await db.replaceFavorites(_current, _favorites.values);
+      }
+    } catch (_) {}
+  }
+
+  Future<void> syncLibraryFromDb() => _queue(_syncLibraryFromDbLocked);
+
+  List<WatchEntry> get history =>
+      _history.values
+          .where((entry) => allowsSource(entry.drama.source))
+          .toList()
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+  List<Drama> get favorites => _favorites.values
+      .where((drama) => allowsSource(drama.source))
+      .toList()
+      .reversed
+      .toList();
+  WatchEntry? watched(String id) {
+    final entry = _history[id];
+    return entry != null && allowsSource(entry.drama.source) ? entry : null;
+  }
+
+  bool isFavorite(String id) =>
+      _favorites[id] != null && allowsSource(_favorites[id]!.source);
+  FollowState? following(String id) =>
+      isFavorite(id) ? _followStates[id] : null;
+  List<Drama> seriesDramasFor(Drama anchor) {
+    if (!allowsSource(SourceSite.hongguo.id) ||
+        anchor.source != SourceSite.hongguo.id) {
+      return const [];
+    }
+    final items = <String, Drama>{};
+    for (final drama in _seriesCandidates.values) {
+      if (allowsSource(drama.source)) items[drama.id] = drama;
+    }
+    for (final drama in _favorites.values) {
+      if (allowsSource(drama.source)) items[drama.id] = drama;
+    }
+    for (final entry in _history.values) {
+      if (allowsSource(entry.drama.source)) items[entry.drama.id] = entry.drama;
+    }
+    final notices = <SeriesSeasonNotice>[
+      ...?_followStates[anchor.id]?.seriesSeasons.values,
+      for (final state in _followStates.values)
+        if (state.seriesSeasons.containsKey(anchor.id))
+          state.seriesSeasons[anchor.id]!,
+    ];
+    for (final notice in notices) {
+      items.putIfAbsent(
+        notice.id,
+        () => Drama(
+          id: notice.id,
+          source: SourceSite.hongguo.id,
+          sourceId: notice.id.substring(SourceSite.hongguo.id.length + 1),
+          title: notice.title,
+        ),
+      );
+    }
+    final current = items.remove(anchor.id) ?? anchor;
+    final rest = items.values.toList()
+      ..sort((a, b) => naturalTitleCompare(a.title, b.title));
+    return [current, ...rest];
+  }
+
+  bool get hideVip =>
+      _configurationError == null ? _bool(_key('hideVip')) ?? true : true;
+  String get displayMode {
+    final value = _configurationError == null ? _string('displayMode') : null;
+    return {'auto', 'television', 'standard'}.contains(value) ? value! : 'auto';
+  }
+
+  String get source {
+    if (locked) return '';
+    final visible = visibleSources;
+    final value = _string(_key('source')) ?? '';
+    // 首页默认站源只在可见站源中选择；站源被隐藏后自动落到下一个可见源。
+    return visible.any((site) => site.id == value)
+        ? value
+        : visible.firstOrNull?.id ?? sources.firstOrNull?.id ?? '';
+  }
+
+  DownloadPreferences get downloadPreferences {
+    if (locked) return const DownloadPreferences();
+    try {
+      return DownloadPreferences.fromJson(
+        jsonDecode(_string(_key('downloadPreferences')) ?? '{}')
+            as Map<String, dynamic>,
+      );
+    } catch (_) {
+      return const DownloadPreferences();
+    }
+  }
+
+  PlaybackPreferences get playbackPreferences {
+    if (locked) return const PlaybackPreferences();
+    try {
+      return PlaybackPreferences.fromJson(
+        jsonDecode(_string(_key('playback')) ?? '{}') as Map<String, dynamic>,
+      );
+    } catch (_) {
+      return const PlaybackPreferences();
+    }
+  }
+
+  CatalogView get catalogView {
+    if (locked) return const CatalogView();
+    try {
+      return CatalogView.fromJson(
+        Map<String, dynamic>.from(
+          jsonDecode(_string(_key('catalogView')) ?? '{}') as Map,
+        ),
+      );
+    } catch (_) {
+      return const CatalogView();
+    }
+  }
+
+  List<String> get recentSearches {
+    if (locked) return const [];
+    try {
+      return (jsonDecode(_string(_key('recentSearches')) ?? '[]') as List)
+          .whereType<String>()
+          .take(20)
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  Future<void> setCatalogView(CatalogView value) =>
+      _setting(_key('catalogView'), jsonEncode(value.toJson()));
+
+  Future<void> setCatalogSource(String source, {required bool allSources}) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(source) || epoch != _epoch) {
+        throw StateError('当前用户没有此站源权限');
+      }
+      await _commit({
+        _key('source'): source,
+        _key('catalogView'): jsonEncode(
+          catalogView.copyWith(allSources: allSources).toJson(),
+        ),
+      });
+      _notify();
+    });
+  }
+
+  /// 视频区按区记忆的上次站点：'__all__' 表示全部站源模式，其余为站源 id。
+  static const zoneSourceAll = '__all__';
+
+  Map<String, String> _zoneSources() {
+    try {
+      final raw = _string(_key('zoneSources'));
+      if (raw == null || raw.isEmpty) return {};
+      final decoded = jsonDecode(raw);
+      if (decoded is! Map) return {};
+      return {
+        for (final entry in decoded.entries)
+          if (entry.key is String && entry.value is String)
+            entry.key as String: entry.value as String,
+      };
+    } catch (_) {
+      return {};
+    }
+  }
+
+  /// 读某视频区（drama/vod）上次选中的站，'' 表示没记过。
+  /// 只读不回落；回落由调用方按当前区可见源做（站不存在或被门禁藏起时落默认站）。
+  String zoneSource(String zone) {
+    if (locked) return '';
+    return _zoneSources()[zone] ?? '';
+  }
+
+  /// 切换视频区站点时立即记盘。尽力而为：写盘失败不抛错、不影响切站本身。
+  Future<void> setZoneSource(String zone, String source) {
+    final epoch = _epoch;
+    return _queue(() async {
+      try {
+        if (locked || epoch != _epoch) return;
+        final values = _zoneSources();
+        values[zone] = source;
+        await _commit({_key('zoneSources'): jsonEncode(values)});
+        _notify();
+      } catch (_) {}
+    });
+  }
+
+  Future<void> rememberSearch(String text) {
+    final query = text.trim();
+    if (query.isEmpty || query.runes.length > 80) return Future.value();
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final entries = [
+        query,
+        ...recentSearches.where(
+          (entry) => normalizedSearchText(entry) != normalizedSearchText(query),
+        ),
+      ].take(20).toList();
+      await _commit({_key('recentSearches'): jsonEncode(entries)});
+      _notify();
+    });
+  }
+
+  Future<void> clearRecentSearches() => _setting(_key('recentSearches'), '[]');
+
+  Future<void> _commit(
+    Map<String, Object> changes, {
+    Iterable<String> remove = const [],
+    bool replace = false,
+  }) async {
+    final snapshot = _snapshot;
+    if (snapshot == null) throw StateError('请先恢复本地配置');
+    final values = replace ? <String, Object>{} : snapshot.values;
+    for (final key in remove) {
+      values.remove(key);
+    }
+    values.addAll(changes);
+    values.putIfAbsent(
+      'profiles',
+      () => jsonEncode(_profiles.map((profile) => profile.toJson()).toList()),
+    );
+    values.putIfAbsent('activeProfile', () => _current);
+    try {
+      await snapshot.commit(values);
+      try {
+        await _syncLibraryKeysToDb(changes, remove);
+      } catch (_) {}
+    } on SnapshotRecoveryRequired catch (error) {
+      _block(error.toString());
+      _notify();
+      rethrow;
+    }
+  }
+
+  Future<void> _setting(String key, Object value, {bool admin = false}) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (admin) _requireAdmin();
+      if (locked || epoch != _epoch) throw StateError('当前用户已变更，请重试');
+      await _commit({key: value});
+      _notify();
+    });
+  }
+
+  Future<void> setHideVip(bool value) => _setting(_key('hideVip'), value);
+
+  bool get pythonCfDisguise => _configurationError == null
+      ? _bool(_key('pythonCfDisguise')) ?? true
+      : true;
+
+  Future<void> setPythonCfDisguise(bool value) =>
+      _setting(_key('pythonCfDisguise'), value);
+
+  bool get jarFingerprintEnabled => _configurationError == null
+      ? _bool(_key('jarFingerprintEnabled')) ?? true
+      : true;
+
+  Future<void> setJarFingerprintEnabled(bool value) =>
+      _setting(_key('jarFingerprintEnabled'), value);
+
+  /// 网盘浏览是否显示疑似广告视频（默认隐藏，只过滤显示、不删文件）。
+  bool get showSuspectedAdVideos => _configurationError == null
+      ? _bool(_key('showSuspectedAdVideos')) ?? false
+      : false;
+
+  Future<void> setShowSuspectedAdVideos(bool value) =>
+      _setting(_key('showSuspectedAdVideos'), value);
+
+  DateTime? get siteCheckLastRun {
+    final raw = _string('site_check_last_run');
+    final millis = raw == null ? null : int.tryParse(raw);
+    if (millis == null) return null;
+    return DateTime.fromMillisecondsSinceEpoch(millis);
+  }
+
+  Future<void> setSiteCheckLastRun(DateTime value) =>
+      _setting('site_check_last_run', value.millisecondsSinceEpoch.toString());
+
+  /// 站点健康记录全量 JSON（独立键，不进用户配置、不随源列表走）。
+  String? get siteHealthJson => _string('site_health_v1');
+
+  Future<void> setSiteHealthJson(String value) =>
+      _setting('site_health_v1', value);
+
+  /// 健康排序总开关（默认开）：关时不打点、不重排。
+  bool get siteHealthEnabled => _configurationError == null
+      ? _bool(_key('siteHealthEnabled')) ?? true
+      : true;
+
+  Future<void> setSiteHealthEnabled(bool value) {
+    SiteHealthStore.instance.enabled = value;
+    return _setting(_key('siteHealthEnabled'), value);
+  }
+
+  /// 选站弹窗按健康排序（默认关，保持配置顺序）。
+  bool get sitePickerHealthSort => _configurationError == null
+      ? _bool(_key('sitePickerHealthSort')) ?? false
+      : false;
+
+  Future<void> setSitePickerHealthSort(bool value) =>
+      _setting(_key('sitePickerHealthSort'), value);
+
+  /// 清空全部站点健康学习记录（内存表 + 落盘一并清）。
+  Future<void> clearSiteHealth() async {
+    SiteHealthStore.instance.clear();
+    await setSiteHealthJson(SiteHealthStore.instance.encode());
+  }
+
+  bool get customHeadersEnabled => _configurationError == null
+      ? _bool(_key('customHeadersEnabled')) ?? false
+      : false;
+
+  Future<void> setCustomHeadersEnabled(bool value) =>
+      _setting(_key('customHeadersEnabled'), value);
+
+  List<CustomHeaderRule> get customHeaderRules {
+    if (_configurationError != null) return const [];
+    return parseCustomHeaderRules(_string(_key('customHeaderRules')) ?? '[]');
+  }
+
+  Future<void> setCustomHeaderRules(List<CustomHeaderRule> rules) => _setting(
+    _key('customHeaderRules'),
+    jsonEncode(rules.map((rule) => rule.toJson()).toList()),
+  );
+  Future<void> setSource(String value) {
+    if (!allowsSource(value)) return Future.error(StateError('当前用户没有此站源权限'));
+    return _setting(_key('source'), value);
+  }
+
+  Future<void> setDisplayMode(String value) =>
+      {'auto', 'television', 'standard'}.contains(value)
+      ? _setting('displayMode', value)
+      : Future.value();
+  String get player {
+    final value = _string('player') ?? 'guo';
+    return {'guo', 'xigua'}.contains(value) ? value : 'guo';
+  }
+
+  Future<void> setPlayer(String value) => {'guo', 'xigua'}.contains(value)
+      ? _setting('player', value)
+      : Future.value();
+  /// 当前全局主题（14 套固定主题之一），默认 XP。
+  AppThemeMode get appTheme {
+    final value = _configurationError == null
+        ? _string('appThemeMode')
+        : null;
+    return AppThemeMode.fromStorageValue(value);
+  }
+
+  Future<void> setAppTheme(AppThemeMode mode) =>
+      _setting('appThemeMode', mode.storageValue);
+
+  /// 某套主题绑定的显示方案：导航样式取主题固定值（见
+  /// navStyleForTheme，存值里的导航段是历史遗留、读取时忽略），
+  /// 内容档按存值走，默认全部内容。
+  ThemeDisplayScheme displayScheme(AppThemeMode mode) {
+    final value = _configurationError == null
+        ? _string('themeScheme_${mode.storageValue}')
+        : null;
+    return ThemeDisplayScheme.fromStorageValue(
+      value,
+    ).copyWith(navStyle: navStyleForTheme(mode));
+  }
+
+  /// 写回显示方案：只有内容档是用户可改的，导航样式写值会被主题
+  /// 固定值覆盖后存盘，保证读回的永远是固定映射。
+  Future<void> setDisplayScheme(
+    AppThemeMode mode,
+    ThemeDisplayScheme scheme,
+  ) => _setting(
+    'themeScheme_${mode.storageValue}',
+    scheme.copyWith(navStyle: navStyleForTheme(mode)).storageValue,
+  );
+
+  /// 旧主题系统（模式/风格/强调色/背景）是否还留有存值。
+  /// 旧值不再被读取，只由迁移清理。
+  bool get hasLegacyThemeSettings {
+    if (_configurationError != null) return false;
+    return _legacyThemeKeys.any((key) => _string(key) != null);
+  }
+
+  static const _legacyThemeKeys = [
+    'themeMode',
+    'themeModeStyle',
+    'themeStyle',
+    'themeAccent',
+    'themeBackground',
+    'themeBackgroundImage',
+  ];
+
+  /// 旧主题偏好迁移：删掉旧键，并清掉旧自定义背景图文件。
+  /// 锁定或快照未就绪时跳过，等下次启动再迁；旧值不影响新主题。
+  Future<void> migrateLegacyThemeSettings() async {
+    if (locked || _snapshot == null || !hasLegacyThemeSettings) return;
+    final imageFile = _string('themeBackgroundImage') ?? '';
+    await _queue(() async {
+      await _commit({}, remove: _legacyThemeKeys);
+      _notify();
+    });
+    if (imageFile.isNotEmpty) {
+      try {
+        final docs = await getApplicationDocumentsDirectory();
+        final file = File('${docs.path}/theme_background/$imageFile');
+        if (file.existsSync()) await file.delete();
+      } catch (_) {}
+    }
+  }
+
+  /// 导入 JSON 列表站名修复（2026-11-21）：老导入的站名可能
+  /// 是蜘蛛回落的通用名“JSON List”/“JSON列表”（以前 ping
+  /// 不带 ext，蜘蛛名取不到就回落，登记名又被它覆盖）。启动时
+  /// 读盘重算一次站名并写回登记与 ext；名字已经正常的站不动，
+  /// 不读盘；读不到文件、内容为空的站不动，下次启动再试。
+  Future<void> repairImportedJsonListNames() async {
+    if (locked) return;
+    final records = List<ImportedSiteRecord>.of(_importedSiteRecords);
+    var changed = false;
+    for (var i = 0; i < records.length; i++) {
+      final record = records[i];
+      if (record.type != ImportedSiteRecord.typeJsonList) continue;
+      final name = record.name.trim();
+      if (name.isNotEmpty && name != 'JSON List' && name != 'JSON列表') {
+        continue;
+      }
+      final path = jsonListPathFromExt(record.ext);
+      if (path.isEmpty) continue;
+      try {
+        final bytes = await File(path).readAsBytes();
+        final parsed = await parseJsonListBytesAsync(bytes);
+        if (parsed.items.isEmpty) continue;
+        final fileName = path.split('/').last;
+        final derived = jsonListDisplayName(parsed.items, fileName);
+        if (derived.isEmpty || derived == name) continue;
+        records[i] = record.copyWith(
+          name: derived,
+          ext: jsonListExtFor(path: path, name: derived),
+        );
+        changed = true;
+      } catch (_) {
+        continue;
+      }
+    }
+    if (changed) await syncImportedSites(records);
+  }
+
+  Future<void> setPlaybackPreferences(PlaybackPreferences value) {
+    PlaybackPreferences.fromJson(value.toJson());
+    return _setting(_key('playback'), jsonEncode(value.toJson()));
+  }
+
+  // 红果播放页设置：直接走 SharedPreferences，不进 LocalSnapshot 受管字段。
+  // 原因是 LocalSnapshot 只接受 String（布尔只有 hideVip 等三例）且键要进
+  // local_snapshot.dart 的白名单，那个文件不在本次改动范围；红果账号
+  // （hongguo_account.dart）也是同样的直存做法。键是设备级，不分用户。
+  String get hongguoFrameMode {
+    final value = preferences.getString('hongguoFrameMode');
+    return {'fit', 'zoom', 'fill'}.contains(value) ? value! : 'fit';
+  }
+
+  Future<void> setHongguoFrameMode(String value) async {
+    final normalized = {'fit', 'zoom', 'fill'}.contains(value) ? value : 'fit';
+    await preferences.setString('hongguoFrameMode', normalized);
+    _notify();
+  }
+
+  int get hongguoVideoRotation {
+    final value = preferences.getInt('hongguoVideoRotation') ?? 0;
+    return {0, 90, 180, 270}.contains(value) ? value : 0;
+  }
+
+  Future<void> setHongguoVideoRotation(int value) async {
+    final normalized = {0, 90, 180, 270}.contains(value) ? value : 0;
+    await preferences.setInt('hongguoVideoRotation', normalized);
+    _notify();
+  }
+
+  bool get hongguoAlwaysShowProgress =>
+      preferences.getBool('hongguoAlwaysShowProgress') ?? false;
+
+  Future<void> setHongguoAlwaysShowProgress(bool value) async {
+    await preferences.setBool('hongguoAlwaysShowProgress', value);
+    _notify();
+  }
+
+  // 跨季自动连播默认开（用户 2026-11-16 令）：播完本季最后一集
+  // 倒计时 5 秒自动播下一季；关掉则停在选集面板。
+  bool get hongguoSeasonAutoplay =>
+      preferences.getBool('hongguoSeasonAutoplay') ?? true;
+
+  Future<void> setHongguoSeasonAutoplay(bool value) async {
+    await preferences.setBool('hongguoSeasonAutoplay', value);
+    _notify();
+  }
+
+  // 0 表示自动（最高档）；显式档位只认 480/720/1080，其它值归零。
+  int get hongguoQuality {
+    final value = preferences.getInt('hongguoQuality') ?? 0;
+    return {0, 480, 720, 1080}.contains(value) ? value : 0;
+  }
+
+  Future<void> setHongguoQuality(int value) async {
+    final normalized = {0, 480, 720, 1080}.contains(value) ? value : 0;
+    await preferences.setInt('hongguoQuality', normalized);
+    _notify();
+  }
+
+  // 跳过片头片尾（第 7 点）：与红果播放设置同路，直走
+  // SharedPreferences，不进 LocalSnapshot 受管字段。全局开关是
+  // 设备级；分段按剧存，键为 IntroOutroSettings.keyFor(站源, 剧 id)，
+  // 整表存一个 JSON 字符串。默认开：没给某部剧设过分段时判定层
+  // 以 notConfigured 不动作，开着也无副作用。
+  bool get introOutroSkipEnabled =>
+      preferences.getBool('introOutroSkipEnabled') ?? true;
+
+  Future<void> setIntroOutroSkipEnabled(bool value) async {
+    await preferences.setBool('introOutroSkipEnabled', value);
+    _notify();
+  }
+
+  Map<String, IntroOutroSettings> get introOutroSkipByDrama =>
+      IntroOutroSettings.decodeMap(
+        preferences.getString('introOutroSkipByDrama'),
+      );
+
+  IntroOutroSettings introOutroFor(String source, String dramaId) =>
+      introOutroSkipByDrama[IntroOutroSettings.keyFor(source, dramaId)] ??
+      const IntroOutroSettings();
+
+  Future<void> setIntroOutroFor(
+    String source,
+    String dramaId,
+    IntroOutroSettings settings,
+  ) async {
+    final values = introOutroSkipByDrama;
+    final key = IntroOutroSettings.keyFor(source, dramaId);
+    if (settings.isEmpty) {
+      values.remove(key);
+    } else {
+      values[key] = settings;
+    }
+    await preferences.setString(
+      'introOutroSkipByDrama',
+      IntroOutroSettings.encodeMap(values),
+    );
+    _notify();
+  }
+
+  // 解码失败教训：JSON 对象，键是“编码|宽|高”，值是失败次数。
+  // Dart 侧取流结果只带高度，编码/宽未知时记空串与 0，见
+  // hongguo_playback_page.dart 的 HongguoDecoderLessons。
+  String get hongguoDecoderLessonsRaw =>
+      preferences.getString('hongguoDecoderLessons') ?? '';
+
+  Future<void> setHongguoDecoderLessons(String raw) async {
+    await preferences.setString('hongguoDecoderLessons', raw);
+    _notify();
+  }
+
+  Future<void> setDownloadPreferences(DownloadPreferences value) {
+    DownloadPreferences.fromJson(value.toJson());
+    return _setting(_key('downloadPreferences'), jsonEncode(value.toJson()));
+  }
+
+  Future<void> toggleFavorite(Drama drama) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(drama.source) || epoch != _epoch) return;
+      final entries = Map.of(_favorites);
+      final states = Map.of(_followStates);
+      if (entries.containsKey(drama.id)) {
+        entries.remove(drama.id);
+        states.remove(drama.id);
+      } else {
+        if (entries.length >= 20000) throw StateError('追剧数量已达上限，请先整理追剧');
+        entries[drama.id] = drama;
+        states[drama.id] = FollowState.initial(drama, _history[drama.id]);
+      }
+      await _commit({
+        _key('favorites'): jsonEncode(
+          entries.values.map((entry) => entry.toJson()).toList(),
+        ),
+        _key('followStates'): _encodeFollowStates(states),
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  String _encodeFollowStates(Map<String, FollowState> states) => jsonEncode({
+    for (final entry in states.entries) entry.key: entry.value.toJson(),
+  });
+
+  Future<void> setFollowStatus(Drama drama, FollowStatus status) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(drama.source) || epoch != _epoch) return;
+      if (!_favorites.containsKey(drama.id) && _favorites.length >= 20000) {
+        throw StateError('追剧数量已达上限，请先整理追剧');
+      }
+      final current = _favorites[drama.id]?.merge(drama) ?? drama;
+      final entries = Map.of(_favorites)..[drama.id] = current;
+      final state =
+          (_followStates[drama.id] ??
+                  FollowState.initial(current, _history[drama.id]))
+              .observe(current)
+              .withStatus(status);
+      final states = Map.of(_followStates)..[drama.id] = state;
+      await _commit({
+        _key('favorites'): jsonEncode(
+          entries.values.map((entry) => entry.toJson()).toList(),
+        ),
+        _key('followStates'): _encodeFollowStates(states),
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> markUpdatesRead(String id) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!isFavorite(id) || epoch != _epoch) return;
+      final states = Map.of(_followStates)
+        ..[id] = _followStates[id]!.markRead();
+      await _commit({_key('followStates'): _encodeFollowStates(states)});
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> markSeriesSeasonRead(String id, String seasonId) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!isFavorite(id) || epoch != _epoch) return;
+      final current = _followStates[id]!;
+      final updated = current.markSeriesSeasonRead(seasonId);
+      if (identical(current, updated)) return;
+      final states = Map.of(_followStates)..[id] = updated;
+      await _commit({_key('followStates'): _encodeFollowStates(states)});
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> saveWatch(
+    WatchEntry entry, {
+    double watchSeconds = 0,
+    int completedEpisodes = 0,
+  }) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!allowsSource(entry.drama.source) || epoch != _epoch) return;
+      final stats = watchStats.addSample(
+        source: entry.drama.source,
+        seconds: watchSeconds,
+        episodes: completedEpisodes,
+      );
+      final previous = _history[entry.drama.id]?.drama;
+      final current = previous == null
+          ? entry
+          : WatchEntry(
+              drama: previous.merge(entry.drama),
+              episode: entry.episode,
+              position: entry.position,
+              duration: entry.duration,
+              updatedAt: entry.updatedAt,
+            );
+      final entries = Map.of(_history)..[entry.drama.id] = current;
+      final sorted = entries.values.toList()
+        ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+      final following = _followStates[entry.drama.id];
+      final states = Map.of(_followStates);
+      final favorites = Map.of(_favorites);
+      if (following != null) {
+        states[entry.drama.id] = following.afterPlayback(current);
+        favorites[entry.drama.id] = favorites[entry.drama.id]!.merge(
+          current.drama,
+        );
+      }
+      await _commit({
+        _key('history'): jsonEncode(
+          sorted.take(300).map((entry) => entry.toJson()).toList(),
+        ),
+        _key('watchStats'): jsonEncode(stats.toJson()),
+        if (following != null) ...{
+          _key('followStates'): _encodeFollowStates(states),
+          _key('favorites'): jsonEncode(
+            favorites.values.map((entry) => entry.toJson()).toList(),
+          ),
+        },
+      });
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  WatchEntry? mediaWatched(String id) {
+    if (!canDownload) return null;
+    try {
+      final data = jsonDecode(_string(_key('mediaHistory')) ?? '{}') as Map;
+      final entry = data[id] == null
+          ? null
+          : WatchEntry.fromJson(Map<String, dynamic>.from(data[id] as Map));
+      return entry != null && allowsSource(entry.drama.source) ? entry : null;
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<void> saveMediaWatch(
+    String id,
+    WatchEntry entry, {
+    double watchSeconds = 0,
+    int completedEpisodes = 0,
+  }) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (!canDownload ||
+          !allowsSource(entry.drama.source) ||
+          epoch != _epoch) {
+        return;
+      }
+      final data = jsonDecode(_string(_key('mediaHistory')) ?? '{}') as Map;
+      data.remove(id);
+      data[id] = entry.toJson();
+      while (data.length > 300) {
+        data.remove(data.keys.first);
+      }
+      final stats = watchStats.addSample(
+        source: entry.drama.source,
+        seconds: watchSeconds,
+        episodes: completedEpisodes,
+      );
+      await _commit({
+        _key('mediaHistory'): jsonEncode(data),
+        _key('watchStats'): jsonEncode(stats.toJson()),
+      });
+    });
+  }
+
+  Future<void> clearHistory() {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      await _commit(
+        {},
+        remove: [_key('history')],
+      );
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> removeHistory(String id) {
+    final epoch = _epoch;
+    return _queue(() async {
+      if (watched(id) == null || epoch != _epoch) return;
+      final entries = Map.of(_history)..remove(id);
+      await _commit(
+        {
+          _key('history'): jsonEncode(
+            entries.values.map((entry) => entry.toJson()).toList(),
+          ),
+        },
+      );
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  Future<void> refreshDrama(Drama drama) =>
+      _refreshDramas([drama], cacheSeriesCandidates: false);
+
+  Future<void> refreshDramas(Iterable<Drama> dramas) =>
+      _refreshDramas(dramas, cacheSeriesCandidates: true);
+
+  Future<void> _refreshDramas(
+    Iterable<Drama> dramas, {
+    required bool cacheSeriesCandidates,
+  }) {
+    final epoch = _epoch;
+    final updates = dramas.toList();
+    return _queue(() async {
+      if (locked || epoch != _epoch) return;
+      final changes = <String, Object>{};
+      final favorites = Map.of(_favorites);
+      final history = Map.of(_history);
+      final states = Map.of(_followStates);
+      final seriesCandidates = Map.of(_seriesCandidates);
+      for (final drama in updates) {
+        if (!allowsSource(drama.source)) continue;
+        if (cacheSeriesCandidates && drama.source == SourceSite.hongguo.id) {
+          seriesCandidates[drama.id] = (seriesCandidates[drama.id] ?? drama)
+              .merge(drama);
+        }
+        final favorite = favorites[drama.id];
+        if (favorite != null) {
+          favorites[drama.id] = favorite.merge(drama);
+          states[drama.id] = states[drama.id]!.observe(favorites[drama.id]!);
+        }
+        final watched = history[drama.id];
+        if (watched != null) {
+          history[drama.id] = WatchEntry(
+            drama: watched.drama.merge(drama),
+            episode: watched.episode,
+            position: watched.position,
+            duration: watched.duration,
+            updatedAt: watched.updatedAt,
+          );
+        }
+      }
+      final candidates = <String, Drama>{
+        for (final entry in history.values) entry.drama.id: entry.drama,
+        ...favorites,
+        for (final drama in updates)
+          if (allowsSource(drama.source)) drama.id: drama,
+      };
+      for (final state in states.values) {
+        for (final notice in state.seriesSeasons.values) {
+          candidates.putIfAbsent(
+            notice.id,
+            () => Drama(
+              id: notice.id,
+              source: SourceSite.hongguo.id,
+              sourceId: notice.id.substring(SourceSite.hongguo.id.length + 1),
+              title: notice.title,
+            ),
+          );
+        }
+      }
+      final favoriteIds = favorites.keys.toSet();
+      for (final favorite in favorites.values) {
+        if (favorite.source != SourceSite.hongguo.id ||
+            states[favorite.id] == null) {
+          continue;
+        }
+        states[favorite.id] = observeHongguoSeriesSeasons(
+          anchor: favorite,
+          state: states[favorite.id]!,
+          candidates: candidates.values,
+          favoriteIds: favoriteIds,
+        );
+      }
+      final favoriteJson = jsonEncode(
+        favorites.values.map((entry) => entry.toJson()).toList(),
+      );
+      final historyJson = jsonEncode(
+        history.values.map((entry) => entry.toJson()).toList(),
+      );
+      final statesJson = _encodeFollowStates(states);
+      final seriesCandidateJson = cacheSeriesCandidates
+          ? jsonEncode(
+              (seriesCandidates.values.toList()
+                    ..sort((a, b) => a.id.compareTo(b.id)))
+                  .take(2000)
+                  .map((entry) => entry.toJson())
+                  .toList(),
+            )
+          : null;
+      if (favoriteJson !=
+          jsonEncode(
+            _favorites.values.map((entry) => entry.toJson()).toList(),
+          )) {
+        changes[_key('favorites')] = favoriteJson;
+      }
+      if (historyJson !=
+          jsonEncode(_history.values.map((entry) => entry.toJson()).toList())) {
+        changes[_key('history')] = historyJson;
+      }
+      if (statesJson != _encodeFollowStates(_followStates)) {
+        changes[_key('followStates')] = statesJson;
+      }
+      if (seriesCandidateJson != null &&
+          seriesCandidateJson !=
+              jsonEncode(
+                (_seriesCandidates.values.toList()
+                      ..sort((a, b) => a.id.compareTo(b.id)))
+                    .take(2000)
+                    .map((entry) => entry.toJson())
+                    .toList(),
+              )) {
+        changes[_key('seriesCandidates')] = seriesCandidateJson;
+      }
+      if (changes.isEmpty) return;
+      await _commit(changes);
+      _loadLibrary();
+      _notify();
+    });
+  }
+
+  void _requireAdmin() {
+    if (locked || !profile.admin) throw StateError('仅管理员可以修改此设置');
+  }
+
+  Future<void> _checkPin(LocalProfile target, String pin) async {
+    if (DateTime.now().isBefore(_retryAfter)) {
+      throw StateError('密码输入过于频繁，请稍后再试');
+    }
+    if (!await checkProfilePin(target, pin)) {
+      _failures++;
+      if (_failures >= 3) {
+        _retryAfter = DateTime.now().add(
+          Duration(seconds: (_failures * 2).clamp(0, 30)),
+        );
+      }
+      throw StateError('密码不正确');
+    }
+    _failures = 0;
+  }
+
+  Future<void> switchProfile(String id, {String pin = ''}) => _queue(() async {
+    if (_configurationError != null) throw StateError('本地用户配置损坏，请先恢复');
+    final target = _profiles.firstWhere((profile) => profile.id == id);
+    await _checkPin(target, pin);
+    await _commit({'activeProfile': id});
+    _current = id;
+    _locked = false;
+    _loadLibrary();
+    await _syncLibraryFromDbLocked();
+    _epoch++;
+    _notify();
+  });
+
+  Future<void> saveProfile({
+    String? id,
+    required String name,
+    required List<String> sources,
+    required bool download,
+    String? pin,
+  }) => _queue(() async {
+    _requireAdmin();
+    final old = _profiles.where((profile) => profile.id == id).firstOrNull;
+    final targetId = old?.id ?? randomProfileToken();
+    final cleanName = name.trim();
+    if (cleanName.isEmpty || cleanName.length > 40) {
+      throw StateError('用户名需要 1 至 40 个字符');
+    }
+    if (sources.any((source) => !SourceSite.isKnown(source))) {
+      throw StateError('站源无效');
+    }
+    if (targetId != 'default' &&
+        !_profiles.firstWhere((profile) => profile.admin).protected) {
+      throw StateError('请先为管理员设置密码，再创建或修改其他用户');
+    }
+    if (old == null && _profiles.length >= 20) {
+      throw StateError('最多支持 20 个本地用户');
+    }
+    var salt = old?.salt ?? '', hash = old?.pinHash ?? '';
+    if (pin != null) {
+      if (pin.isEmpty) {
+        if (targetId == 'default' && _profiles.length > 1) {
+          throw StateError('存在其他用户时不能取消管理员密码');
+        }
+        salt = '';
+        hash = '';
+      } else {
+        if (pin.length < 6 || pin.length > 128) {
+          throw StateError('密码需要 6 至 128 个字符');
+        }
+        salt = randomProfileToken();
+        hash = await hashProfilePin(pin, salt);
+      }
+    }
+    _requireAdmin();
+    final updated = LocalProfile(
+      id: targetId,
+      name: cleanName,
+      admin: targetId == 'default',
+      sources: sources.toSet().toList(),
+      download: download,
+      salt: salt,
+      pinHash: hash,
+    );
+    final profiles =
+        [
+          for (final profile in _profiles)
+            if (profile.id != targetId) profile,
+          updated,
+        ]..sort(
+          (a, b) => a.admin
+              ? -1
+              : b.admin
+              ? 1
+              : a.name.compareTo(b.name),
+        );
+    await _commit({
+      'profiles': jsonEncode(
+        profiles.map((profile) => profile.toJson()).toList(),
+      ),
+    });
+    _profiles = profiles;
+    _notify();
+  });
+  Future<void> deleteProfile(String id) => _queue(() async {
+    _requireAdmin();
+    if (id == 'default') throw StateError('不能删除管理员');
+    final profiles = _profiles.where((profile) => profile.id != id).toList();
+    await _commit({
+      'profiles': jsonEncode(
+        profiles.map((profile) => profile.toJson()).toList(),
+      ),
+    }, remove: LocalSnapshot.libraryKeys.map((key) => _key(key, id)));
+    _profiles = profiles;
+    _notify();
+  });
+
+  Future<void> reload() => _queue(() async {
+    final previousProfiles = _configurationError == null
+        ? _string('profiles')
+        : null;
+    final previousId = _current;
+    final previousLocked = locked;
+    await preferences.reload();
+    _initialize();
+    if (_configurationError == null &&
+        previousProfiles == _string('profiles') &&
+        previousId == _current) {
+      _locked = previousLocked;
+    } else {
+      _epoch++;
+    }
+    _notify();
+  });
+
+  Future<void> _queue(Future<void> Function() action) {
+    _writes = _writes.catchError((Object _) {}).then((_) => action());
+    return _writes;
+  }
+
+  @override
+  void dispose() {
+    _disposed = true;
+    if (identical(loadImportedLiveChannels, _m3uLoader)) {
+      loadImportedLiveChannels = null;
+    }
+    super.dispose();
+  }
+}

@@ -1,0 +1,489 @@
+import 'dart:convert';
+
+import 'live_models.dart';
+
+enum LiveFormat { m3u, text, json }
+
+class LiveParseResult {
+  const LiveParseResult({
+    required this.groups,
+    this.epg = '',
+    this.format = LiveFormat.text,
+  });
+
+  final List<LiveGroup> groups;
+  final String epg;
+  final LiveFormat format;
+
+  int get channelCount =>
+      groups.fold(0, (total, group) => total + group.channels.length);
+  bool get isEmpty => channelCount == 0;
+}
+
+const _metaPrefixes = [
+  '更新时间',
+  '更新日期',
+  'update time',
+  'update date',
+  'last update',
+];
+
+const liveUnsortedGroup = '其他';
+
+class _ChannelBuilder {
+  _ChannelBuilder(this.name, this.group);
+  final String name;
+  final String group;
+  final List<String> urls = [];
+  Map<String, String> headers = {};
+  String logo = '';
+  String number = '';
+  String tvgId = '';
+  String tvgName = '';
+  LiveCatchup? catchup;
+  String licenseKey = '';
+  String licenseType = '';
+  String format = '';
+}
+
+class _GroupBuilder {
+  _GroupBuilder(this.name);
+  final String name;
+  final Map<String, _ChannelBuilder> channels = {};
+
+  _ChannelBuilder channel(String name) =>
+      channels.putIfAbsent(name, () => _ChannelBuilder(name, this.name));
+
+  bool get isEmpty => channels.isEmpty;
+}
+
+class LiveParser {
+  LiveParser._();
+
+  static final _directive = RegExp(
+    r'^(ua|parse|click|header|format|origin|referer|forceKey|#EXTHTTP:|#EXTVLCOPT:|#KODIPROP:)',
+  );
+  static final _genre = RegExp(r'#genre#');
+  static final _m3uHeader = RegExp(r'#EXTM3U', caseSensitive: false);
+
+  static LiveParseResult parse(
+    String text, {
+    required String source,
+    String defaultGroup = liveUnsortedGroup,
+  }) {
+    if (text.trim().isEmpty) {
+      return const LiveParseResult(groups: []);
+    }
+    final normalized = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    if (normalized.trimLeft().startsWith('[') ||
+        normalized.trimLeft().startsWith('{')) {
+      final json = _parseJson(normalized, source);
+      if (json != null && !json.isEmpty) return json;
+    }
+    if (_m3uHeader.hasMatch(normalized)) {
+      return _parseM3u(normalized, source, defaultGroup);
+    }
+    return _parseText(normalized, source, defaultGroup);
+  }
+
+  static bool _isMetaChannel(String name) {
+    final text = name.trim().toLowerCase();
+    if (text.isEmpty) return false;
+    return _metaPrefixes.any(text.startsWith);
+  }
+
+  static String? _attribute(String line, String key) =>
+      RegExp('$key="(.*?)"').firstMatch(line)?.group(1)?.trim();
+
+  static (String, String?) _splitFirst(String value, String separator) {
+    final at = value.indexOf(separator);
+    if (at < 0) return (value, null);
+    return (value.substring(0, at), value.substring(at + separator.length));
+  }
+
+  /// 取 #EXTINF 行逗号后的频道名：分隔逗号是第一个不在引号内的逗号。
+  /// 原先取最后一个逗号，频道名本身含逗号（如“CCTV-1, 高清”）会被
+  /// 截成后半段；属性值里的逗号在引号内，不会被误认作分隔符。
+  static String _afterComma(String line) {
+    var inQuotes = false;
+    for (var i = 0; i < line.length; i++) {
+      final ch = line[i];
+      if (ch == '"') {
+        inQuotes = !inQuotes;
+      } else if (ch == ',' && !inQuotes) {
+        return line.substring(i + 1).trim();
+      }
+    }
+    return '';
+  }
+
+  static LiveParseResult _parseText(
+    String text,
+    String source,
+    String defaultGroup,
+  ) {
+    final groups = <_GroupBuilder>[];
+    final setters = _Setters();
+    for (final raw in text.split('\n')) {
+      if (raw.isEmpty) continue;
+      if (_directive.hasMatch(raw)) {
+        setters.read(raw);
+        continue;
+      }
+      final parts = _splitFirst(raw, ',');
+      if (_genre.hasMatch(raw)) {
+        setters.clear();
+        final name = parts.$1.trim();
+        groups.add(
+          _GroupBuilder(
+            name.isEmpty || name == '#genre#' ? defaultGroup : name,
+          ),
+        );
+        continue;
+      }
+      final tail = parts.$2;
+      if (tail == null) continue;
+      final name = parts.$1.trim();
+      if (name.isEmpty || _isMetaChannel(name)) continue;
+      for (final entry in tail.split('#')) {
+        final pair = _splitFirst(entry, '|');
+        final url = pair.$1.trim();
+        if (!isPlayableLiveUrl(url)) continue;
+        if (pair.$2 != null && pair.$2!.trim().isNotEmpty) {
+          setters.readHeader(pair.$2!);
+        }
+        final group = groups.isEmpty
+            ? (groups..add(_GroupBuilder(defaultGroup))).last
+            : groups.last;
+        final channel = group.channel(name);
+        channel.urls.add(url);
+        channel.headers = setters.headers();
+        if (setters.licenseKey.isNotEmpty) {
+          channel.licenseKey = setters.licenseKey;
+        }
+        if (setters.licenseType.isNotEmpty) {
+          channel.licenseType = setters.licenseType;
+        }
+        if (setters.format.isNotEmpty) channel.format = setters.format;
+      }
+    }
+    return LiveParseResult(groups: _finalize(groups, source));
+  }
+
+  /// 回看三属性（#EXTM3U 头上是全源默认、#EXTINF 上是本频道覆盖）。
+  static LiveCatchup? _catchupOf(String line) {
+    final item = LiveCatchup(
+      type: _attribute(line, 'catchup') ?? '',
+      source: _attribute(line, 'catchup-source') ?? '',
+      replace: _attribute(line, 'catchup-replace') ?? '',
+    );
+    return item.isEmpty ? null : item;
+  }
+
+  static LiveParseResult _parseM3u(
+    String text,
+    String source,
+    String defaultGroup,
+  ) {
+    final groups = <_GroupBuilder>[];
+    final setters = _Setters();
+    var epg = '';
+    LiveCatchup? globalCatchup;
+    _GroupBuilder? group;
+    _ChannelBuilder? pending;
+
+    for (final raw in text.split('\n')) {
+      if (raw.isEmpty) continue;
+      if (_directive.hasMatch(raw)) {
+        setters.read(raw);
+        continue;
+      }
+      if (raw.startsWith('#EXTM3U')) {
+        epg =
+            _attribute(raw, 'url-tvg') ??
+            _attribute(raw, 'tvg-url') ??
+            _attribute(raw, 'x-tvg-url') ??
+            '';
+        globalCatchup = _catchupOf(raw) ?? globalCatchup;
+        continue;
+      }
+      if (raw.startsWith('#EXTINF:')) {
+        var name = _afterComma(raw);
+        if (name.isEmpty) name = '未命名频道';
+        if (_isMetaChannel(name)) {
+          pending = null;
+          continue;
+        }
+        final title = _attribute(raw, 'group-title');
+        final target = title == null || title.isEmpty ? defaultGroup : title;
+        group = groups.where((entry) => entry.name == target).firstOrNull;
+        if (group == null) {
+          group = _GroupBuilder(target);
+          groups.add(group);
+        }
+        pending = group.channel(name);
+        pending.logo = _attribute(raw, 'tvg-logo') ?? pending.logo;
+        pending.tvgId = _attribute(raw, 'tvg-id') ?? pending.tvgId;
+        pending.tvgName = _attribute(raw, 'tvg-name') ?? pending.tvgName;
+        pending.number = _attribute(raw, 'tvg-chno') ?? pending.number;
+        // 频道自己的回看优先，没有才落全源默认（与 easytv 的
+        // Catchup.decide 同口径：major=频道、minor=全源）。
+        pending.catchup = _catchupOf(raw) ?? pending.catchup ?? globalCatchup;
+        final userAgent = _attribute(raw, 'http-user-agent');
+        if (userAgent != null && userAgent.isNotEmpty) {
+          setters.readHeader('User-Agent=$userAgent');
+        }
+        continue;
+      }
+      if (pending == null || raw.startsWith('#')) continue;
+      final pair = _splitFirst(raw, '|');
+      final url = pair.$1.trim();
+      if (!isPlayableLiveUrl(url)) continue;
+      if (pair.$2 != null && pair.$2!.trim().isNotEmpty) {
+        setters.readHeader(pair.$2!);
+      }
+      pending.urls.add(url);
+      pending.headers = setters.headers();
+      if (setters.licenseKey.isNotEmpty) {
+        pending.licenseKey = setters.licenseKey;
+      }
+      if (setters.licenseType.isNotEmpty) {
+        pending.licenseType = setters.licenseType;
+      }
+      if (setters.format.isNotEmpty) pending.format = setters.format;
+    }
+    return LiveParseResult(
+      groups: _finalize(groups, source),
+      epg: epg,
+      format: LiveFormat.m3u,
+    );
+  }
+
+  static LiveParseResult? _parseJson(String text, String source) {
+    final dynamic decoded;
+    try {
+      decoded = jsonDecode(text);
+    } catch (_) {
+      return null;
+    }
+    final rows = <dynamic>[];
+    if (decoded is List) {
+      rows.addAll(decoded);
+    } else if (decoded is Map) {
+      final nested = decoded['groups'] ?? decoded['list'] ?? decoded['data'];
+      if (nested is List) {
+        rows.addAll(nested);
+      } else {
+        rows.add(decoded);
+      }
+    }
+    final groups = <_GroupBuilder>[];
+    for (final row in rows) {
+      if (row is! Map) continue;
+      final raw =
+          row['channel'] ?? row['channels'] ?? row['list'] ?? row['items'];
+      if (raw is! List) continue;
+      // 同名分组出现两次时合并进同一个分组：原先整段跳过，后一段的
+      // 频道全部丢失（合并订阅里常见）。空分组由 _finalize 统一丢弃，
+      // 故新建分组可直接入列。
+      final groupName = _pick(row, const ['group', 'name', 'title']);
+      final existing = groups
+          .where((entry) => entry.name == groupName)
+          .firstOrNull;
+      final group = existing ?? _GroupBuilder(groupName);
+      if (existing == null) groups.add(group);
+      for (final child in raw) {
+        if (child is! Map) continue;
+        final name = _pick(child, const ['name', 'tvg-name', 'title']);
+        if (name.isEmpty || _isMetaChannel(name)) continue;
+        final urls = <String>[];
+        final value = child['urls'] ?? child['url'];
+        if (value is String) {
+          urls.addAll(value.split('#'));
+        } else if (value is List) {
+          urls.addAll(value.whereType<String>());
+        }
+        final playable = urls
+            .map((entry) => entry.trim())
+            .where(isPlayableLiveUrl)
+            .toList();
+        if (playable.isEmpty) continue;
+        final channel = group.channel(name);
+        final known = channel.urls.length;
+        for (final url in playable) {
+          if (!channel.urls.contains(url)) channel.urls.add(url);
+        }
+        if (channel.urls.length == known) continue;
+        final headers = child['header'] ?? child['headers'];
+        if (headers is Map) {
+          channel.headers = {
+            for (final entry in headers.entries)
+              entry.key.toString(): entry.value.toString(),
+          };
+        } else if (headers is String) {
+          channel.headers = parseLiveHeaders(headers);
+        }
+        channel.logo = _pick(child, const ['logo', 'tvg-logo']);
+        channel.tvgId = _pick(child, const ['tvg-id', 'tvgId']);
+        channel.tvgName = _pick(child, const ['tvg-name', 'tvgName']);
+        channel.number = _pick(child, const ['number', 'tvg-chno']);
+      }
+    }
+    if (groups.every((group) => group.isEmpty)) return null;
+    return LiveParseResult(
+      groups: _finalize(groups, source),
+      format: LiveFormat.json,
+    );
+  }
+
+  static String _pick(Map row, List<String> keys) {
+    for (final key in keys) {
+      final value = row[key];
+      if (value is String && value.trim().isNotEmpty) return value.trim();
+      if (value is num) return '$value';
+    }
+    return '';
+  }
+
+  static List<LiveGroup> _finalize(List<_GroupBuilder> groups, String source) {
+    var number = 0;
+    final result = <LiveGroup>[];
+    for (final group in groups) {
+      final channels = <LiveChannel>[];
+      for (final channel in group.channels.values) {
+        if (channel.urls.isEmpty) continue;
+        number++;
+        channels.add(
+          LiveChannel(
+            key: LiveChannel.makeKey(source, group.name, channel.name),
+            name: channel.name,
+            urls: channel.urls,
+            number: channel.number.isEmpty
+                ? number.toString().padLeft(3, '0')
+                : channel.number.padLeft(3, '0'),
+            headers: channel.headers,
+            logo: channel.logo,
+            group: group.name,
+            source: source,
+            tvgId: channel.tvgId,
+            tvgName: channel.tvgName,
+            catchup: channel.catchup,
+            licenseKey: channel.licenseKey,
+            licenseType: channel.licenseType,
+            format: channel.format,
+          ),
+        );
+      }
+      if (channels.isNotEmpty) result.add(LiveGroup(group.name, channels));
+    }
+    return result;
+  }
+}
+
+class _Setters {
+  final Map<String, String> _headers = {};
+  String _userAgent = '';
+  String _referer = '';
+  String _origin = '';
+  String licenseKey = '';
+  String licenseType = '';
+  String format = '';
+
+  static String _value(String line) {
+    final at = line.indexOf('=');
+    if (at < 0) return '';
+    return line.substring(at + 1).trim();
+  }
+
+  void read(String line) {
+    if (line.startsWith('#EXTHTTP:')) {
+      _headers.addAll(parseLiveHeaders(line.substring(9)));
+      return;
+    }
+    if (line.startsWith('#KODIPROP:inputstream.adaptive.stream_headers') ||
+        line.startsWith('#KODIPROP:inputstream.adaptive.common_headers')) {
+      readHeader(_value(line));
+      return;
+    }
+    if (line.startsWith('#KODIPROP:inputstream.adaptive.license_key')) {
+      licenseKey = _value(line);
+      return;
+    }
+    if (line.startsWith('#KODIPROP:inputstream.adaptive.license_type')) {
+      licenseType = _value(line);
+      return;
+    }
+    if (line.startsWith('#KODIPROP:inputstream.adaptive.drm_legacy')) {
+      // 老式合并写法（类型与键写在一行）：整行存进 licenseKey，
+      // 类型能拆出来就拆（逗号/竖线前一段当类型）。
+      final raw = _value(line);
+      if (licenseKey.isEmpty) licenseKey = raw;
+      if (licenseType.isEmpty) {
+        final split = raw.split(RegExp(r'[,|]'));
+        if (split.length > 1) licenseType = split.first.trim();
+      }
+      return;
+    }
+    if (line.startsWith('#KODIPROP:inputstream.adaptive.manifest_type')) {
+      format = _value(line);
+      return;
+    }
+    if (line.startsWith('format')) {
+      format = _value(line);
+      return;
+    }
+    if (line.startsWith('#EXTVLCOPT:http-cookie')) {
+      _headers['Cookie'] = _value(line);
+      return;
+    }
+    if (line.startsWith('#EXTVLCOPT:http-origin')) {
+      _origin = _value(line);
+      return;
+    }
+    if (line.startsWith('#EXTVLCOPT:http-user-agent')) {
+      _userAgent = _value(line);
+      return;
+    }
+    if (line.startsWith('#EXTVLCOPT:http-referrer')) {
+      _referer = _value(line);
+      return;
+    }
+    if (line.startsWith('ua')) {
+      _userAgent = _value(line);
+      return;
+    }
+    if (line.startsWith('referer')) {
+      _referer = _value(line);
+      return;
+    }
+    if (line.startsWith('origin')) {
+      _origin = _value(line);
+      return;
+    }
+    if (line.startsWith('header')) readHeader(_value(line));
+  }
+
+  void readHeader(String raw) {
+    if (raw.trim().isEmpty) return;
+    _headers.addAll(parseLiveHeaders(raw));
+  }
+
+  Map<String, String> headers() {
+    final result = <String, String>{};
+    if (_userAgent.isNotEmpty) result['User-Agent'] = _userAgent;
+    if (_referer.isNotEmpty) result['Referer'] = _referer;
+    if (_origin.isNotEmpty) result['Origin'] = _origin;
+    result.addAll(_headers);
+    return result;
+  }
+
+  void clear() {
+    _headers.clear();
+    _userAgent = '';
+    _referer = '';
+    _origin = '';
+    licenseKey = '';
+    licenseType = '';
+    format = '';
+  }
+}

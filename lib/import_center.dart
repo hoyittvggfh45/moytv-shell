@@ -1,0 +1,601 @@
+import 'dart:async';
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart';
+
+import 'core_bridge.dart';
+import 'import_file_store.dart';
+import 'jar_bridge_handoff.dart';
+import 'imported_site_record.dart';
+import 'json_list_import.dart';
+import 'legado_gbk.dart';
+import 'local_store.dart';
+import 'py_bridge.dart';
+import 'py_spider_validator.dart';
+import 'source_compat.dart';
+
+class ImportCandidate {
+  const ImportCandidate({
+    required this.name,
+    required this.bytes,
+    this.ext = '',
+  });
+
+  final String name;
+  final List<int> bytes;
+  final String ext;
+
+  String get extension {
+    final at = name.lastIndexOf('.');
+    return at < 0 ? '' : name.substring(at + 1).toLowerCase();
+  }
+
+  /// 文件名口径：去路径、去后缀（与 jar 直导入 fileBaseName 同款）。
+  /// zip 包内条目名、分享路径可能带目录段，显示名不能把路径带出来。
+  String get baseName {
+    var base = name.replaceAll('\\', '/');
+    final slash = base.lastIndexOf('/');
+    if (slash >= 0) base = base.substring(slash + 1);
+    final at = base.lastIndexOf('.');
+    return at < 0 ? base : base.substring(0, at);
+  }
+}
+
+enum ImportOutcomeStatus { success, duplicate, failed }
+
+class ImportOutcome {
+  const ImportOutcome({
+    required this.fileName,
+    required this.status,
+    required this.reason,
+    this.siteName = '',
+    this.siteId = '',
+  });
+
+  final String fileName;
+  final ImportOutcomeStatus status;
+  final String reason;
+  final String siteName;
+  final String siteId;
+
+  bool get ok => status == ImportOutcomeStatus.success;
+}
+
+class ImportReport {
+  const ImportReport(this.outcomes);
+
+  final List<ImportOutcome> outcomes;
+
+  int get successCount => outcomes
+      .where((item) => item.status == ImportOutcomeStatus.success)
+      .length;
+  int get duplicateCount => outcomes
+      .where((item) => item.status == ImportOutcomeStatus.duplicate)
+      .length;
+  int get failedCount => outcomes
+      .where((item) => item.status == ImportOutcomeStatus.failed)
+      .length;
+
+  String get summary =>
+      '成功 $successCount · 重复跳过 $duplicateCount · 失败 $failedCount';
+}
+
+String importSlug(String value) {
+  final slug = value
+      .toLowerCase()
+      .replaceAll(RegExp(r'[^a-z0-9]+'), '_')
+      .replaceAll(RegExp(r'^_+|_+$'), '');
+  if (slug.isEmpty) return 'site';
+  return slug.length > 40 ? slug.substring(0, 40) : slug;
+}
+
+String contentHashOf(List<int> bytes) => sha256.convert(bytes).toString();
+
+class ImportEngine {
+  ImportEngine({required this.store, required this.repository});
+
+  final LocalStore store;
+  final AppRepository repository;
+
+  static const supportedExtensions = {'py', 'js', 'json', 'jar', 'zip'};
+
+  Future<ImportReport> importAll(List<ImportCandidate> candidates) async {
+    final records = List<ImportedSiteRecord>.of(store.importedSiteRecords);
+    final outcomes = <ImportOutcome>[];
+    var recordsChanged = false;
+    for (final candidate in candidates) {
+      final outcome = await _importOne(candidate, records, () {
+        recordsChanged = true;
+      });
+      outcomes.add(outcome);
+    }
+    if (recordsChanged) await store.syncImportedSites(records);
+    return ImportReport(outcomes);
+  }
+
+  Future<ImportOutcome> _importOne(
+    ImportCandidate candidate,
+    List<ImportedSiteRecord> records,
+    void Function() markRecordsChanged,
+  ) async {
+    ImportOutcome fail(String reason) => ImportOutcome(
+      fileName: candidate.name,
+      status: ImportOutcomeStatus.failed,
+      reason: reason,
+    );
+    try {
+      final extension = candidate.extension;
+      if (!supportedExtensions.contains(extension)) {
+        return fail('不支持的文件类型：.$extension（仅支持 py/js/json/jar/zip）');
+      }
+      if (candidate.bytes.isEmpty) return fail('文件为空');
+      final hash = contentHashOf(candidate.bytes);
+      final sameHash = records
+          .where((record) => record.contentHash == hash)
+          .firstOrNull;
+      if (sameHash != null) {
+        return ImportOutcome(
+          fileName: candidate.name,
+          status: ImportOutcomeStatus.duplicate,
+          reason: '内容与已导入的「${sameHash.name}」完全相同，跳过',
+          siteName: sameHash.name,
+          siteId: sameHash.id,
+        );
+      }
+      switch (extension) {
+        case 'py':
+          return await _importPy(candidate, hash, records, markRecordsChanged);
+        case 'js':
+          return await _importJs(candidate, hash, records, markRecordsChanged);
+        case 'json':
+          return await _importJson(
+            candidate,
+            hash,
+            records,
+            markRecordsChanged,
+          );
+        case 'jar':
+          return await _importJar(candidate);
+        case 'zip':
+          return await _importZip(candidate);
+        default:
+          return fail('不支持的文件类型');
+      }
+    } on AppFailure catch (error) {
+      return fail(error.message);
+    } catch (error) {
+      return fail(error.toString());
+    }
+  }
+
+  String _uniqueId(
+    String prefix,
+    String baseName,
+    List<ImportedSiteRecord> records,
+    String hash,
+  ) {
+    var id = '$prefix:${importSlug(baseName)}';
+    if (records.any((record) => record.id == id)) {
+      id = '$id-${hash.substring(0, 6)}';
+    }
+    return id;
+  }
+
+  Future<ImportOutcome> _importPy(
+    ImportCandidate candidate,
+    String hash,
+    List<ImportedSiteRecord> records,
+    void Function() markRecordsChanged,
+  ) async {
+    String source;
+    List<int> saveBytes;
+    try {
+      final decoded = utf8.decode(candidate.bytes);
+      source = decoded.startsWith('\uFEFF') ? decoded.substring(1) : decoded;
+      saveBytes = candidate.bytes;
+    } catch (_) {
+      final decoded = decodeGbkBytes(candidate.bytes);
+      source = decoded;
+      final head = decoded.split('\n').take(2).join('\n');
+      final hasCookie = RegExp(r'coding[:=]\s*[-\w.]+').hasMatch(head);
+      saveBytes = hasCookie
+          ? candidate.bytes
+          : [...utf8.encode('# -*- coding: gbk -*-\n'), ...candidate.bytes];
+    }
+    final validation = validatePySource(source);
+    if (!validation.ok) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: validation.message,
+      );
+    }
+    final hostValidation = await PyBridge.validate(source);
+    if (hostValidation != null && !hostValidation.ok) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '运行时校验未通过：${hostValidation.error}',
+      );
+    }
+    final hostNote = (hostValidation?.degraded ?? false)
+        ? '；文件较大，运行时校验超时，已按静态校验结果放行'
+        : '';
+    final id = _uniqueId('py', candidate.baseName, records, hash);
+    final fileName = await ImportFileStore.save(id, 'py', saveBytes);
+    records.add(
+      ImportedSiteRecord(
+        id: id,
+        name: candidate.baseName,
+        type: ImportedSiteRecord.typePy,
+        fileName: fileName,
+        contentHash: hash,
+        importedAtMs: DateTime.now().millisecondsSinceEpoch,
+        ext: candidate.ext,
+        baseName: candidate.baseName,
+      ),
+    );
+    markRecordsChanged();
+    // 站名以文件名为准（2026-11-26 用户令，与 jar 直导入同口径）：
+    // 不再 ping 蜘蛛拿自报的 getName 覆盖登记名——此前 ping 成功时
+    // 站点显示的是蜘蛛自报名、看不到文件名，用户实报「导入注册的
+    // 站点不显示文件名」。蜘蛛名只影响运行时取数，不进登记名。
+    final displayName = candidate.baseName;
+    final filledNote = validation.filledNote;
+    return ImportOutcome(
+      fileName: candidate.name,
+      status: ImportOutcomeStatus.success,
+      reason: validation.playOnly
+          ? '已注册为仅播放模式 Python 蜘蛛站（经 CPython 桥执行）；$filledNote$hostNote'
+          : filledNote.isEmpty
+          ? '已注册为 Python 蜘蛛站（经 CPython 桥执行）$hostNote'
+          : '已注册为 Python 蜘蛛站（经 CPython 桥执行）；$filledNote$hostNote',
+      siteName: displayName,
+      siteId: id,
+    );
+  }
+
+  Future<ImportOutcome> _importJs(
+    ImportCandidate candidate,
+    String hash,
+    List<ImportedSiteRecord> records,
+    void Function() markRecordsChanged,
+  ) async {
+    final String source;
+    try {
+      source = utf8.decode(candidate.bytes);
+    } catch (_) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '文件不是有效的 UTF-8 文本，无法作为 JS 蜘蛛导入',
+      );
+    }
+    final problem = identifyJsSource(source);
+    if (problem != null) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: problem,
+      );
+    }
+    // drpy 声明式规则（rule 对象 + 一级/二级规则串）不是蜘蛛函数，
+    // JS 引擎跑不了：直接拒绝并指明去处，不让它注册成打不开的站。
+    if (classifyJsSource(source) == JsSourceShape.drpyRule) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason:
+            '该文件是 drpy 声明式规则（rule 对象 + 一级/二级规则串），JS 引擎无法直接运行，请改走 drpy-node 小程序或 drpyS 服务',
+      );
+    }
+    final id = _uniqueId('js', candidate.baseName, records, hash);
+    final fileName = await ImportFileStore.save(id, 'js', candidate.bytes);
+    records.add(
+      ImportedSiteRecord(
+        id: id,
+        name: candidate.baseName,
+        type: ImportedSiteRecord.typeJs,
+        fileName: fileName,
+        contentHash: hash,
+        importedAtMs: DateTime.now().millisecondsSinceEpoch,
+        baseName: candidate.baseName,
+      ),
+    );
+    markRecordsChanged();
+    return ImportOutcome(
+      fileName: candidate.name,
+      status: ImportOutcomeStatus.success,
+      reason: '已注册为 JS 蜘蛛站（经内置 Go 脚本引擎执行，安卓与 iOS 同一套引擎，不走网页视图）',
+      siteName: candidate.baseName,
+    );
+  }
+
+  bool _isXbpqRule(Map<String, dynamic> parsed) =>
+      parsed.containsKey('主页url') ||
+      (parsed.containsKey('分类url') && parsed.containsKey('数组')) ||
+      (parsed.containsKey('分类') && parsed.containsKey('数组'));
+
+  Future<ImportOutcome> _importJson(
+    ImportCandidate candidate,
+    String hash,
+    List<ImportedSiteRecord> records,
+    void Function() markRecordsChanged,
+  ) async {
+    // 视频列表 JSON 先判：顶层含 parse 键的列表文件会被下面的
+    // TVBox 配置分支误认（配置判定只看有无 parse/sites 等键），
+    // 必须先拦。不是列表（无可用条目）时往下走原有各分支。
+    final listParsed = await parseJsonListBytesAsync(candidate.bytes);
+    if (listParsed.items.isNotEmpty &&
+        hasUsableVideoListItem(listParsed.items)) {
+      return _importJsonList(
+        candidate,
+        hash,
+        records,
+        markRecordsChanged,
+        listParsed,
+      );
+    }
+    // 列表形态但无可用条目：报清“列表为空”，不往下误判成别的格式。
+    if (listParsed.hasListShape) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '视频列表里没有可播的条目：list 为空，或条目都没有播放地址',
+      );
+    }
+    final String text;
+    try {
+      text = utf8.decode(candidate.bytes);
+    } catch (_) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '文件不是有效的 UTF-8 文本',
+      );
+    }
+    final dynamic parsed;
+    try {
+      parsed = jsonDecode(text);
+    } catch (error) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: 'JSON 解析失败：$error',
+      );
+    }
+    if (parsed is Map<String, dynamic> && _isXbpqRule(parsed)) {
+      final ruleHash = contentHashOf(utf8.encode(text.trim()));
+      final duplicate = store.customSources
+          .where(
+            (site) =>
+                site.hasRule &&
+                contentHashOf(utf8.encode(site.rule.trim())) == ruleHash,
+          )
+          .firstOrNull;
+      if (duplicate != null) {
+        return ImportOutcome(
+          fileName: candidate.name,
+          status: ImportOutcomeStatus.duplicate,
+          reason: '内容与已导入的规则站「${duplicate.name}」相同，跳过',
+          siteName: duplicate.name,
+        );
+      }
+      final name =
+          (parsed['站名'] as String?) ??
+          (parsed['name'] as String?) ??
+          candidate.baseName;
+      final base = parsed['主页url'] as String? ?? '';
+      await repository.addCustomSource(name: name, base: base, rule: text);
+      await store.syncCustomSources(await repository.customSources());
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.success,
+        reason: '已识别为 XBPQ 规则，注册到核心 XBPQ 引擎通道',
+        siteName: name,
+      );
+    }
+    if (parsed is Map<String, dynamic> &&
+        (parsed.containsKey('sites') ||
+            parsed.containsKey('spider') ||
+            parsed.containsKey('lives') ||
+            parsed.containsKey('live') ||
+            parsed.containsKey('parses') ||
+            parsed.containsKey('parse'))) {
+      final summary = await JarBridgeHandoff.importTvBoxConfig(
+        repository: repository,
+        name: candidate.baseName,
+        content: text,
+      );
+      // 远程配置里的站同样直接写静态注册表（TvBoxImporter），
+      // 补一次通知，各处站点列表立即重算。
+      store.refreshSiteRegistry();
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.success,
+        reason: summary,
+        siteName: candidate.baseName,
+      );
+    }
+    final looksCustom =
+        parsed is List ||
+        (parsed is Map<String, dynamic> &&
+            (parsed['sources'] is List || parsed['items'] is List));
+    if (looksCustom) {
+      final result = await repository.importCustomSources(text);
+      await store.syncCustomSources(await repository.customSources());
+      final added = (result['added'] as List? ?? const []).length;
+      final updated = (result['updated'] as List? ?? const []).length;
+      if (added + updated > 0) {
+        return ImportOutcome(
+          fileName: candidate.name,
+          status: ImportOutcomeStatus.success,
+          reason: '已识别为自定义源 JSON，新增 $added 个、更新 $updated 个',
+          siteName: candidate.baseName,
+        );
+      }
+      final failed = (result['failed'] as List? ?? const [])
+          .map((item) => item.toString())
+          .join('；');
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '自定义源通道未接受该文件${failed.isEmpty ? '' : '：$failed'}',
+      );
+    }
+    return ImportOutcome(
+      fileName: candidate.name,
+      status: ImportOutcomeStatus.failed,
+      reason:
+          '无法识别的 JSON：既不是 XBPQ 规则（含主页url/分类/数组等字段）、'
+          'TVBox 配置（含 sites/spider），也不是自定义源格式',
+    );
+  }
+
+  /// TVBox 视频列表 JSON 导入：规范化存盘 + 生成读盘蜘蛛 + 登记。
+  /// 干净文件原样存；损坏文件只存找回的条目重编的干净 JSON，
+  /// 蜘蛛只读干净文件。站名从内容取（不拿乱码文件名当站名），
+  /// 成人站显示名带 🔞。ping 只作尽力确认（与 _importPy 同款，
+  /// 运行时不可用时不拦导入）。
+  Future<ImportOutcome> _importJsonList(
+    ImportCandidate candidate,
+    String hash,
+    List<ImportedSiteRecord> records,
+    void Function() markRecordsChanged,
+    JsonListParseResult parsed,
+  ) async {
+    final displayName = jsonListDisplayName(parsed.items, candidate.baseName);
+    final spiderSource = buildJsonListSpiderSource();
+    final validation = validatePySource(spiderSource);
+    if (!validation.ok) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '内置列表蜘蛛校验未通过：${validation.message}',
+      );
+    }
+    final id = _uniqueId('jsonlist', candidate.baseName, records, hash);
+    final List<int> jsonBytes;
+    if (parsed.damaged) {
+      jsonBytes = utf8.encode(
+        jsonEncode({'list': parsed.items, 'parse': 0, 'jx': 0}),
+      );
+    } else {
+      jsonBytes = candidate.bytes;
+    }
+    final jsonFileName = await ImportFileStore.save(id, 'json', jsonBytes);
+    final jsonPath = await ImportFileStore.pathOf(jsonFileName);
+    final pyFileName = await ImportFileStore.save(
+      id,
+      'py',
+      utf8.encode(spiderSource),
+    );
+    records.add(
+      ImportedSiteRecord(
+        id: id,
+        name: displayName,
+        type: ImportedSiteRecord.typeJsonList,
+        fileName: pyFileName,
+        contentHash: hash,
+        importedAtMs: DateTime.now().millisecondsSinceEpoch,
+        ext: jsonListExtFor(path: jsonPath, name: displayName),
+        baseName: displayName,
+      ),
+    );
+    markRecordsChanged();
+    try {
+      final path = await ImportFileStore.pathOf(pyFileName);
+      // 2026-11-21 修：ping 必须带上 ext，否则蜘蛛 init 拿不到
+      // 名字、getName 回落成通用名 "JSON List"，下面又会把登记名
+      // 覆盖成它——导入的 JSON 站就全叫 JSON List（用户 08:43
+      // 截图）。带上 ext 后蜘蛛名就是推导出的站名，不再覆盖。
+      // 2026-11-25 修：ping 只是尽力确认，默认 70 秒超时会让整批
+      // 导入长时间无反馈，压到 10 秒；超时/失败都忽略（外层 catch）。
+      final ping = await PyBridge.call(path, {
+        'action': 'ping',
+        'extend': jsonListExtFor(path: jsonPath, name: displayName),
+      }).timeout(const Duration(seconds: 10));
+      final spiderName = (ping['name'] as String? ?? '').trim();
+      if (spiderName.isNotEmpty &&
+          spiderName != displayName &&
+          spiderName != 'JSON List' &&
+          spiderName != 'JSON列表') {
+        final index = records.indexWhere((record) => record.id == id);
+        if (index >= 0) {
+          // 基准名一起改：统一序号重排按 baseName 分组，只改 name
+          // 会被重排拉回内容推导名，等于白确认。
+          records[index] = records[index].copyWith(
+            name: spiderName,
+            baseName: spiderName,
+          );
+          markRecordsChanged();
+        }
+      }
+    } catch (_) {}
+    final damageNote = parsed.damaged
+        ? '（文件有损坏，已只收完好条目${parsed.skipped > 0 ? '，跳过损坏条目 ${parsed.skipped} 条' : ''}）'
+        : '';
+    return ImportOutcome(
+      fileName: candidate.name,
+      status: ImportOutcomeStatus.success,
+      reason:
+          '已注册为 JSON 列表站「$displayName」：${parsed.items.length} 条$damageNote',
+      siteName: displayName,
+      siteId: id,
+    );
+  }
+
+  Future<ImportOutcome> _importJar(ImportCandidate candidate) async {
+    final bytes = candidate.bytes;
+    if (bytes.length < 2 || bytes[0] != 0x50 || bytes[1] != 0x4B) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '不是有效的 jar 文件（缺少 zip 文件头）',
+      );
+    }
+    final result = await JarBridgeHandoff.registerJar(
+      name: candidate.baseName,
+      bytes: bytes,
+    );
+    // jar 站直接写 SourceSite.importedSites（静态注册表），
+    // 这里补一次通知：各处站点列表（含女优库顶栏切换）监听到
+    // 才重建，新站不用等下次打开才出现。
+    store.refreshSiteRegistry();
+    return ImportOutcome(
+      fileName: candidate.name,
+      status: ImportOutcomeStatus.success,
+      reason: result.summary,
+      siteName: result.siteNames.isEmpty
+          ? candidate.baseName
+          : result.siteNames.first,
+      siteId: result.siteIds.isEmpty ? '' : result.siteIds.first,
+    );
+  }
+
+  Future<ImportOutcome> _importZip(ImportCandidate candidate) async {
+    final bytes = candidate.bytes;
+    if (bytes.length < 2 || bytes[0] != 0x50 || bytes[1] != 0x4B) {
+      return ImportOutcome(
+        fileName: candidate.name,
+        status: ImportOutcomeStatus.failed,
+        reason: '不是有效的 zip 包（缺少 zip 文件头）',
+      );
+    }
+    final result = await JarBridgeHandoff.registerZip(
+      name: candidate.baseName,
+      bytes: bytes,
+    );
+    // 同 jar：zip 里的站同样直接写静态注册表，补一次通知。
+    store.refreshSiteRegistry();
+    return ImportOutcome(
+      fileName: candidate.name,
+      status: ImportOutcomeStatus.success,
+      reason: result.summary,
+      siteName: result.siteNames.isEmpty
+          ? candidate.baseName
+          : result.siteNames.first,
+      siteId: result.siteIds.isEmpty ? '' : result.siteIds.first,
+    );
+  }
+}

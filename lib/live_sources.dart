@@ -1,0 +1,467 @@
+import 'whos_live_bridge.dart';
+
+enum LiveProtocol { pingtai, list, api }
+
+class LiveSource {
+  const LiveSource({
+    required this.id,
+    required this.name,
+    required this.description,
+    required this.protocol,
+    this.endpoints = const [],
+    this.script = '',
+    this.headers = const {},
+    this.epg = '',
+    this.group = '',
+    this.adult = false,
+    this.builtin = true,
+    this.enabled = true,
+    this.paginated = false,
+    this.greenCategoryFilter = true,
+  });
+
+  final String id;
+  final String name;
+  final String description;
+  final LiveProtocol protocol;
+
+  /// 同一面板的多个镜像。它们共享内容但各自维护分类子集，合并后按分类路由。
+  final List<String> endpoints;
+  final String script;
+
+  String get endpoint => endpoints.isEmpty ? '' : endpoints.first;
+  final Map<String, String> headers;
+  final String epg;
+
+  /// 列表型源没有分组信息时的默认分组名。
+  final String group;
+
+  /// 成人站源。绿色模式开启时整个源不出现在直播里。
+  final bool adult;
+  final bool builtin;
+  final bool enabled;
+
+  /// 是否支持按页续载。整类一次返回的源不参与滚动加载。
+  final bool paginated;
+
+  /// 绿色模式下是否按白名单过滤分类。主流直播源的分类是分区/游戏名，
+  /// 不在白名单里，设为 false 才能正常显示；成人源与导入源保持默认 true。
+  final bool greenCategoryFilter;
+
+  static const values = <LiveSource>[
+    // 内置片库：优先读本地数据库 MYTV/db/女优库.db（34 万+，全是
+    // m3u8 直链），没库才读 documents/actress_json/ 里的两个 JSON；
+    // 包里不带任何种子（2026-11-22 用户令）。走 whoslib:// 由本地
+    // 库出频道，不联网、不用订阅。
+    LiveSource(
+      id: whosLibSourceId,
+      name: '🔞内置片库',
+      description: '装机自带片库 · 按厂牌分类 · 点开就播',
+      protocol: LiveProtocol.list,
+      endpoints: ['whoslib://all'],
+      group: '内置片库',
+      adult: true,
+      paginated: true,
+    ),
+    LiveSource(
+      id: 'xiuguo',
+      name: '🔞秀果',
+      description: '主播直播 · 实时开播',
+      protocol: LiveProtocol.pingtai,
+      endpoints: [
+        'http://api.vipmisss.com:81/xcdsw',
+        'http://api.hclyz.com:81/mf',
+      ],
+      adult: true,
+    ),
+    LiveSource(
+      id: 'maiyoux',
+      name: '🔞欲火聚合',
+      description: '欲火移植 · 平台动态聚合 · 实时开播',
+      protocol: LiveProtocol.pingtai,
+      endpoints: [
+        'http://api.maiyoux.com:81/mf',
+        'http://api.vipmisss.com:81/xcdsw',
+      ],
+      adult: true,
+    ),
+    LiveSource(
+      id: 'bnzb',
+      name: '🔞百年直播',
+      description: '百年直播 · 多平台聚合 · 实时开播',
+      protocol: LiveProtocol.pingtai,
+      endpoints: ['http://api.vipmisss.com:81/xcdsw'],
+      adult: true,
+    ),
+    LiveSource(
+      id: 'user_m3u',
+      name: '🔞成人点播',
+      description: '用户提供的 m3u · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/user_m3u.m3u'],
+      adult: true,
+    ),
+    // 2026-11-14 内置的 22 个清洗版 m3u 清单（TG 私发，清洗版已复查）：
+    // 每文件一个源，文件对应分组——有 group-title 的条目走其分组，
+    // 无 group-title 的条目落入 group 默认分组（与文件同名）。
+    // 资产文件为清洗版字节原样（仅 12_wuma/18_mingxing 各删 1 行
+    // 地址哈希含 loli 子串的孤行地址，条目一条不少），见
+    // test/live_m3u_builtin_test.dart 的条数与安全扫描守卫。
+    // 全部 adult: true，沿用绿色模式整源隐藏的现有语义。
+    LiveSource(
+      id: 'm3u_zhubo',
+      name: '🔞主播网红',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/01_zhubo.m3u'],
+      group: '主播网红',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_luanlun',
+      name: '🔞乱伦精品',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/02_luanlun.m3u'],
+      group: '乱伦精品',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_huayu',
+      name: '🔞华语精品',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/03_huayu.m3u'],
+      group: '华语精品',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_guochan',
+      name: '🔞国产精品',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/04_guochan.m3u'],
+      group: '国产精品',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_xuesheng',
+      name: '🔞学生合集',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/05_xuesheng.m3u'],
+      group: '学生合集',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_tanhua',
+      name: '🔞探花约炮',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/06_tanhua.m3u'],
+      group: '探花约炮',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_riben',
+      name: '🔞日本有码',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/07_riben.m3u'],
+      group: '日本有码',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_oumei',
+      name: '🔞欧美大屌',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/08_oumei.m3u'],
+      group: '欧美大屌',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_heilian',
+      name: '🔞黑料吃瓜',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/09_heilian.m3u'],
+      group: '黑料吃瓜',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_community10',
+      name: '🔞社区合集 10',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/10_community10.m3u8'],
+      group: '社区合集 10',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_community11',
+      name: '🔞社区合集 11',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/11_community11.m3u8'],
+      group: '社区合集 11',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_wuma',
+      name: '🔞無碼專區',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/12_wuma.m3u'],
+      group: '無碼專區',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_wanghong',
+      name: '🔞網紅頭條',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/13_wanghong.m3u'],
+      group: '網紅頭條',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_xingba',
+      name: '🔞杏吧原創',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/14_xingba.m3u'],
+      group: '杏吧原創',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_chengtou',
+      name: '🔞成人頭條',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/15_chengtou.m3u'],
+      group: '成人頭條',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_zhifu',
+      name: '🔞制服絲襪',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/16_zhifu.m3u'],
+      group: '制服絲襪',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_qunjiao',
+      name: '🔞群交淫亂',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/17_qunjiao.m3u'],
+      group: '群交淫亂',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_mingxing',
+      name: '🔞明星換臉',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/18_mingxing.m3u'],
+      group: '明星換臉',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_zipai',
+      name: '🔞自拍偷拍',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/19_zipai.m3u'],
+      group: '自拍偷拍',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_avxiongdi',
+      name: '🔞AV兄弟无码',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/20_avxiongdi.m3u'],
+      group: 'AV兄弟无码',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_guochanse',
+      name: '🔞国产色情',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/21_guochanse.m3u'],
+      group: '国产色情',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'm3u_riben2',
+      name: '🔞日本有码 2',
+      description: '用户提供的 m3u 清单 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['asset://assets/live/m3u/22_riben2.m3u'],
+      group: '日本有码',
+      adult: true,
+    ),
+    LiveSource(
+      id: 'bilibili',
+      name: '哔哩哔哩',
+      description: 'B站直播 · 分区房间 · 列表已验活',
+      protocol: LiveProtocol.api,
+      greenCategoryFilter: false,
+      paginated: true,
+    ),
+    // 2026-11-26 真果鉴直播批：虎牙走公开接口（列表 cache.php +
+    // 房间页内嵌 stream 数据直取页面 anticode 拼 FLV），验活验播后登记。
+    LiveSource(
+      id: 'huya',
+      name: '虎果',
+      description: '虎牙直播 · 热门房间 · 列表已验活',
+      protocol: LiveProtocol.api,
+      greenCategoryFilter: false,
+      paginated: true,
+    ),
+    // 2026-11-26 真果鉴直播批：*.445569.xyz 平台聚合表（远端 m3u 清单，
+    // 表内是各平台当前在播房间）。逐表验活 + 抽样验播通过后登记：
+    // 斗鱼/酷狗的表内地址经表方解析后 302 直达官方 CDN（FLV/HLS），
+    // 抖音为官方 CDN 的 HLS 直链，Twitch 经表方 302 直达官方
+    // usher 播放列表，快手/TikTok 为官方签名 FLV 直链。
+    // 分组名是游戏/分区名，与哔哩哔哩同口径关掉绿色分类白名单过滤。
+    LiveSource(
+      id: 'douyu_m3u',
+      name: '斗果',
+      description: '斗鱼直播聚合表 · 实时在播房间 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['https://douyu.445569.xyz/live.m3u'],
+      group: '斗鱼直播',
+      greenCategoryFilter: false,
+    ),
+    LiveSource(
+      id: 'douyin_m3u',
+      name: '音果',
+      description: '抖音直播聚合表 · 实时在播房间 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['https://douyin.445569.xyz/live.m3u'],
+      group: '抖音直播',
+      greenCategoryFilter: false,
+    ),
+    LiveSource(
+      id: 'kugou_live_m3u',
+      name: '狗果',
+      description: '酷狗直播聚合表 · 实时在播房间 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['https://kugou.445569.xyz/live.m3u'],
+      group: '酷狗直播',
+      greenCategoryFilter: false,
+    ),
+    LiveSource(
+      id: 'kuaishou_m3u',
+      name: '手果',
+      description: '快手直播聚合表 · 实时在播房间 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['https://kuaishou.445569.xyz/list.m3u'],
+      group: '快手直播',
+      greenCategoryFilter: false,
+    ),
+    LiveSource(
+      id: 'twitch_m3u',
+      name: '弦果',
+      description: 'Twitch 直播聚合表 · 实时在播房间 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['https://twitch.445569.xyz/live.m3u'],
+      group: 'Twitch',
+      greenCategoryFilter: false,
+    ),
+    LiveSource(
+      id: 'tiktok_m3u',
+      name: '跃果',
+      description: 'TikTok 直播聚合表 · 实时在播房间 · 点开即播',
+      protocol: LiveProtocol.list,
+      endpoints: ['https://tiktok.445569.xyz/live.m3u'],
+      group: 'TikTok',
+      greenCategoryFilter: false,
+    ),
+    // 2026-11-26 真果鉴直播批：成人 cam 站走各自公开接口验播后登记，
+    // 成人口径同既有成人源（adult: true，绿色模式整源隐藏）。
+    // Stripchat：前台公开列表接口 + doppiocdn 直拼 HLS；Cam4：目录
+    // JSON 自带 HLS 预览地址。
+    LiveSource(
+      id: 'stripchat',
+      name: '🔞彩果',
+      description: 'Stripchat · 在线主播 · 实时开播',
+      protocol: LiveProtocol.api,
+      adult: true,
+    ),
+    LiveSource(
+      id: 'cam4',
+      name: '🔞卡果',
+      description: 'Cam4 · 在线主播 · 实时开播',
+      protocol: LiveProtocol.api,
+      adult: true,
+    ),
+  ];
+
+  static final List<LiveSource> importedValues = [];
+
+  static final Map<String, LiveSource> importedSources = {};
+
+  static List<LiveSource> get allValues => [
+    ...values,
+    ...importedValues,
+    ...importedSources.values,
+  ];
+
+  static List<LiveSource> get all => allValues;
+
+  /// 绿色模式放行的直播分类名。改成白名单而不是罗列成人特征词：直播面板的
+  /// 分类以「卡哇伊」「花蝴蝶」「蜜桃」「小妲己」这类花名为主，黑名单列不全，
+  /// 实测 137 个分类里只有「卫视直播」属于公开电视直播，其余全是秀场。
+  /// 白名单下没被明确认定为绿色的分类一律不展示。
+  static final _greenCategory = RegExp(
+    r'(卫视|央视|CCTV|CGTN|电视直播|广播|新闻|体育|财经|少儿|纪录|地方台|剧场|电影|电视剧)',
+    caseSensitive: false,
+  );
+
+  /// 绿色模式下的直播可见性：成人源整源隐藏，成人分类单独隐藏。
+  static List<LiveSource> visible(bool greenMode) => [
+    for (final source in allValues)
+      if (!greenMode || !source.adult) source,
+  ];
+
+  static bool hidesCategory(String name, {required bool greenMode}) =>
+      greenMode && !_greenCategory.hasMatch(name);
+
+  /// 在既有内置源之外追加一个源，仅用于验证绿色模式的整源过滤。
+  static List<LiveSource> spreadWith(
+    LiveSource extra, {
+    required bool greenMode,
+  }) => [
+    for (final source in [...values, extra])
+      if (!greenMode || !source.adult) source,
+  ];
+
+  static LiveSource? byId(String id) =>
+      allValues.where((source) => source.id == id).firstOrNull;
+
+  static bool isBuiltin(String id) => values.any((source) => source.id == id);
+
+  LiveSource copyWith({bool? enabled}) => LiveSource(
+    id: id,
+    name: name,
+    description: description,
+    protocol: protocol,
+    endpoints: endpoints,
+    script: script,
+    headers: headers,
+    epg: epg,
+    group: group,
+    adult: adult,
+    builtin: builtin,
+    enabled: enabled ?? this.enabled,
+    paginated: paginated,
+    greenCategoryFilter: greenCategoryFilter,
+  );
+}

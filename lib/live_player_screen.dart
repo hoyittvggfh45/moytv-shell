@@ -1,0 +1,588 @@
+import 'dart:async';
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
+
+import 'app_layout.dart';
+import 'app_notice.dart';
+import 'app_orientation.dart';
+import 'app_theme.dart';
+import 'live_playback.dart';
+import 'live_sources.dart';
+import 'live_store.dart';
+import 'playback_foreground.dart';
+import 'playback_preferences.dart';
+import 'tvbox_video_pane.dart';
+import 'package:moyi/xigua/player_controls.dart';
+import 'package:moyi/network_speed.dart';
+import 'package:moyi/xigua/player_interactions.dart';
+import 'package:moyi/xigua/television_controls.dart';
+import 'widgets.dart';
+import 'sleep_timer.dart';
+
+/// 直播全屏：复用点播播放器的控件层，保证与点播一致的观感与操作。
+class LivePlayerScreen extends StatefulWidget {
+  const LivePlayerScreen({
+    super.key,
+    required this.playback,
+    required this.source,
+    required this.store,
+    this.videoBuilder,
+    this.swipeSeek,
+  });
+
+  final LivePlaybackController playback;
+  final LiveSource source;
+  final LiveStore store;
+
+  /// 左右滑动一屏的秒数：直播页没有设置入口，由调用方把播放设置
+  /// 里的值传进来；不传默认 60 秒（以前写死的值）。
+  final int Function()? swipeSeek;
+
+  /// 测试注入：同 LiveScreen.videoBuilder，代替真实 Video。
+  final Widget Function(LivePlaybackController playback, bool fullscreen)?
+  videoBuilder;
+
+  @override
+  State<LivePlayerScreen> createState() => _LivePlayerScreenState();
+}
+
+class _LivePlayerScreenState extends State<LivePlayerScreen>
+    with WidgetsBindingObserver {
+  PlayerInteractions? _interactions;
+  late final NetworkSpeedTracker _speedTracker;
+  StreamSubscription<Duration>? _positionSubscription;
+  final _focus = FocusNode();
+  bool _panel = false;
+  bool _playbackServiceHeld = false;
+  // 切后台只留音频时视频轨的状态：true = 已关掉视频轨。
+  bool _videoTrackOff = false;
+  bool _immersed = false;
+  bool _exiting = false;
+  AppOrientationController? _orientationController;
+  bool _television = false;
+  bool _landscape = true;
+  bool _rotated = false;
+  bool _orientationApplied = false;
+  Animation<double>? _orientationAnimation;
+  void Function(AnimationStatus)? _orientationListener;
+
+  LivePlaybackController get _playback => widget.playback;
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden) {
+      // 切后台只留音频：视频轨一关，mpv 不再解码视频帧；
+      // 直播声音照常在后台播，回前台再开画面。
+      final player = _playback.player;
+      if (player != null && player.state.playing && !_videoTrackOff) {
+        _videoTrackOff = true;
+        unawaited(player.setVideoTrack(VideoTrack.no()));
+      }
+      if (!_playbackServiceHeld && (_playback.player?.state.playing ?? false)) {
+        _playbackServiceHeld = true;
+        unawaited(PlaybackForeground.acquire(_playback.channel?.name ?? '直播'));
+      }
+    } else if (state == AppLifecycleState.resumed) {
+      if (_videoTrackOff) {
+        _videoTrackOff = false;
+        final player = _playback.player;
+        if (player != null) {
+          unawaited(player.setVideoTrack(VideoTrack.auto()));
+        }
+      }
+    }
+  }
+
+  @override
+  void initState() {
+    super.initState();
+    _playback.addListener(_changed);
+    WidgetsBinding.instance.addObserver(this);
+    // DRM 频道走 EXO、mpv 播放器可能根本没建：手势/网速采样那套
+    // mpv 专属接线只在 player 存在时挂，EXO 全屏走 build 里的
+    // pane 分支，不碰这里。
+    final mpvPlayer = _playback.player;
+    if (mpvPlayer != null) {
+      _ensureInteractions(mpvPlayer);
+      _positionSubscription = mpvPlayer.stream.position.listen((_) {
+        unawaited(_speedTracker.tick());
+      });
+    }
+    _speedTracker = NetworkSpeedTracker(
+      sample: () async {
+        final player = _playback.player;
+        if (player == null) return null;
+        return fetchMpvNetworkSpeedSample(player);
+      },
+    );
+    if (Platform.isAndroid) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+      _immersed = true;
+    }
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _television = AppLayout.isTelevision(context);
+    _orientationController = AppOrientationScope.maybeOf(context);
+    _followVideoRatio();
+    _applyOrientationDeferred();
+  }
+
+  /// 全屏方向跟随画面比例：竖屏流全屏仍是竖屏，横屏流全屏是横屏。
+  /// 用户按过旋转按钮后以手动选择为准，不再自动跟随。
+  bool _followVideoRatio() {
+    if (_television || _rotated) return false;
+    final landscape = _playback.aspectRatio >= 1;
+    if (landscape == _landscape) return false;
+    _landscape = landscape;
+    return true;
+  }
+
+  /// 进页面即按画面比例锁方向并全屏；旋转按钮在横竖屏之间切换。
+  Future<void> _applyOrientation() async {
+    if (_television) return;
+    try {
+      await _orientationController?.setPlayback(
+        this,
+        fullscreen: true,
+        aspectRatio: _landscape ? 16 / 9 : 9 / 16,
+      );
+    } catch (_) {
+      // 方向被系统策略拒绝时保持当前方向，不影响播放。
+    }
+  }
+
+  void _applyOrientationDeferred() {
+    if (_television ||
+        _orientationApplied ||
+        _orientationAnimation != null) {
+      return;
+    }
+    final animation = ModalRoute.of(context)?.animation;
+    if (animation == null || animation.status == AnimationStatus.completed) {
+      _orientationApplied = true;
+      unawaited(_applyOrientation());
+      return;
+    }
+    _orientationAnimation = animation;
+    _orientationListener = (status) {
+      if (status == AnimationStatus.completed &&
+          mounted &&
+          !_orientationApplied) {
+        _orientationApplied = true;
+        _cancelDeferredOrientation();
+        unawaited(_applyOrientation());
+      }
+    };
+    animation.addStatusListener(_orientationListener!);
+    Future.delayed(const Duration(seconds: 1), () {
+      if (mounted && !_orientationApplied) {
+        _orientationApplied = true;
+        _cancelDeferredOrientation();
+        unawaited(_applyOrientation());
+      }
+    });
+  }
+
+  void _cancelDeferredOrientation() {
+    final animation = _orientationAnimation;
+    final listener = _orientationListener;
+    _orientationAnimation = null;
+    _orientationListener = null;
+    if (animation != null && listener != null) {
+      animation.removeStatusListener(listener);
+    }
+  }
+
+  Future<void> _toggleRotate() async {
+    if (_television) return;
+    _rotated = true;
+    _cancelDeferredOrientation();
+    _orientationApplied = true;
+    setState(() => _landscape = !_landscape);
+    await _applyOrientation();
+    if (Platform.isAndroid) {
+      await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
+    }
+  }
+
+  @override
+  void dispose() {
+    _cancelDeferredOrientation();
+    _playback.removeListener(_changed);
+    WidgetsBinding.instance.removeObserver(this);
+    if (_playbackServiceHeld) {
+      _playbackServiceHeld = false;
+      unawaited(PlaybackForeground.release());
+    }
+    _positionSubscription?.cancel();
+    _speedTracker.dispose();
+    _interactions?.dispose();
+    _focus.dispose();
+    unawaited(
+      (_orientationController?.releasePlayback(this) ?? Future<void>.value())
+          .catchError((Object _) {}),
+    );
+    if (Platform.isAndroid) {
+      SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+    }
+    super.dispose();
+  }
+
+  void _ensureInteractions(Player player) {
+    _interactions ??= PlayerInteractions(
+      player: player,
+      available: () => !_panel && _playback.error == null,
+      baseSpeed: () => 1,
+      holdSpeed: () => 1,
+      swipeSeek: widget.swipeSeek ?? () => 60,
+      onTogglePlayback: _toggle,
+      onFullscreen: _exit,
+      onEpisode: _switchHint,
+      onSeek: (duration) async {},
+    );
+  }
+
+  void _changed() {
+    if (!mounted) return;
+    // 全屏里从 DRM 频道切到普通频道时 mpv 是这时才建的，补挂手势。
+    final player = _playback.player;
+    if (player != null && _interactions == null) {
+      _ensureInteractions(player);
+      _positionSubscription ??= player.stream.position.listen((_) {
+        unawaited(_speedTracker.tick());
+      });
+    }
+    if (_followVideoRatio() && _orientationApplied) {
+      unawaited(_applyOrientation());
+      if (Platform.isAndroid) {
+        unawaited(
+          SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky),
+        );
+      }
+    }
+    setState(() {});
+  }
+
+  void _toggle() {
+    final player = _playback.player;
+    if (player == null) return;
+    unawaited(player.playOrPause());
+  }
+
+  void _exit() {
+    // 唯一退出路径：直接 pop，不走 maybePop。
+    // PopScope(canPop: false) 下 maybePop 不弹路由、只回调 onPopInvokedWithResult，
+    // 回调又调回 _liveBack/_exit，形成无界重入环，路由永远弹不出（真机死机）。
+    // Navigator.pop 绕过 veto，didPop=true 时回调里的 !didPop 守卫会跳过 _liveBack。
+    // 内嵌 Video 的重新挂载只由 LiveScreen 在 push Future 完成后复位 _detached，
+    // 这里不再提前回调，避免退场过渡期间两个 Video 同挂一个 controller。
+    if (_exiting) return;
+    _exiting = true;
+    Navigator.pop(context);
+  }
+
+  void _liveBack() {
+    if (_television) {
+      _exit();
+      return;
+    }
+    if (_immersed) {
+      if (Platform.isAndroid) {
+        SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+      }
+      setState(() => _immersed = false);
+      return;
+    }
+    _exit();
+  }
+
+  String _switchHint(int direction) {
+    _playback.switchBy(direction);
+    return direction > 0 ? '下一个频道' : '上一个频道';
+  }
+
+  Future<void> _showSleepTimer() async {
+    if (_panel) return;
+    _interactions?.cancel();
+    setState(() => _panel = true);
+    try {
+      await showSleepTimerSheet(
+        context,
+        controller: _playback.sleepTimer,
+        showFinishEpisode: false,
+        onSelect: (choice) {
+          if (mounted) _playback.sleepTimer.select(choice);
+        },
+      );
+    } finally {
+      if (mounted) setState(() => _panel = false);
+    }
+  }
+
+  Future<void> _selectChannel() async {
+    final channels = _playback.channels;
+    if (channels.isEmpty) return;
+    setState(() => _panel = true);
+    final index = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      backgroundColor: const Color(0xFF1B1B1F),
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '${widget.source.name} · ${channels.length} 个频道',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: channels.length,
+                itemBuilder: (context, index) {
+                  final selected = index == _playback.index;
+                  return ListTile(
+                    dense: true,
+                    selected: selected,
+                    title: Text(
+                      channels[index].label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                    onTap: () => Navigator.pop(context, index),
+                  );
+                },
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (!mounted) return;
+    setState(() => _panel = false);
+    if (index != null) await _playback.play(index);
+  }
+
+  Future<void> _selectRoute() async {
+    final channel = _playback.channel;
+    if (channel == null || channel.urls.length < 2) {
+      _toast('当前频道只有一条线路');
+      return;
+    }
+    final index = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      backgroundColor: const Color(0xFF1B1B1F),
+      builder: (context) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            for (var index = 0; index < channel.urls.length; index++)
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.route_rounded),
+                title: Text(
+                  '线路 ${index + 1}',
+                  style: const TextStyle(color: Colors.white),
+                ),
+                onTap: () => Navigator.pop(context, index),
+              ),
+          ],
+        ),
+      ),
+    );
+    if (index == null || !mounted) return;
+    await _playback.playRoute(index);
+  }
+
+  void _toast(String message) {
+    if (!mounted) return;
+    AppNotice.show(context, message);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    // DRM 频道全屏：同样走 EXO pane（与直播页主画面同一计划与
+    // 句柄），不碰 mpv 的控件层。pane 自带返回/全屏钮与播放暂停；
+    // 报错时叠与普通路同款的中断面板，重连仍走 EXO 重开。
+    final exoPlan = _playback.exoPlan;
+    if (exoPlan != null && widget.videoBuilder == null) {
+      final error = _playback.error;
+      return PopScope(
+        canPop: true,
+        child: Scaffold(
+          backgroundColor: Colors.black,
+          body: Theme(
+            data: AppTheme.dark,
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                TvboxVideoPane(
+                  key: const ValueKey('live-exo-pane-fullscreen'),
+                  plan: exoPlan,
+                  startPosition: 0,
+                  autoplay: true,
+                  decoderMode: switch (_playback.decoderMode) {
+                    LiveDecoderMode.auto => TelevisionDecoder.optimized,
+                    LiveDecoderMode.hardware => TelevisionDecoder.hardware,
+                    LiveDecoderMode.software => TelevisionDecoder.software,
+                  },
+                  handle: _playback.exoHandle,
+                  onCompleted: _playback.reportExoCompleted,
+                  onError: _playback.reportExoError,
+                  onBack: _exit,
+                  onFullscreen: _exit,
+                  isFullscreen: true,
+                ),
+                if (error != null)
+                  ColoredBox(
+                    color: Colors.black.withValues(alpha: .82),
+                    child: StatusPanel(
+                      title: '直播暂时中断',
+                      message: error,
+                      icon: Icons.wifi_off_rounded,
+                      action: '重新连接',
+                      onRetry: () => unawaited(_playback.retry()),
+                      secondaryAction: TextButton(
+                        onPressed: _selectChannel,
+                        child: const Text('换个频道'),
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+    final television = AppLayout.isTelevision(context);
+    final controller = _playback.controller;
+    final channel = _playback.channel;
+    final error = _playback.error;
+    final player = _playback.player;
+    final title = channel == null
+        ? widget.source.name
+        : '${channel.name} · ${widget.source.name}';
+    final Widget controls = player == null
+        ? const SizedBox.shrink()
+        : television
+        ? TelevisionControls(
+            player: player,
+            title: title,
+            enabled: error == null,
+            showOnPlaybackReady: false,
+            onTogglePlayback: _toggle,
+            onSeek: (_) {},
+            onPrevious: () => _playback.switchBy(-1),
+            onNext: () => _playback.switchBy(1),
+            onEpisodes: _selectChannel,
+            onSettings: _selectRoute,
+            onSleepTimer: _showSleepTimer,
+            sleepTimerLabel: _playback.sleepTimer.label,
+            onBack: _exit,
+          )
+        : PlayerControls(
+            key: ValueKey('live-controls-$_immersed'),
+            player: player,
+            interactions: _interactions!,
+            enabled: error == null,
+            panelOpen: _panel,
+            fullscreen: true,
+            showOnPlaybackReady: false,
+            title: title,
+            onTogglePlayback: _toggle,
+            swipeEnabled: true,
+            onRotate: _toggleRotate,
+            onFullscreen: _exit,
+            onBack: _liveBack,
+            onFocusSurface: _focus.requestFocus,
+            onSeek: (duration) async {},
+            speed: 1,
+            networkSpeed: _speedTracker.speedText,
+            qualityLabel: channel != null && channel.urls.length > 1
+                ? '线路 ${channel.urls.length}'
+                : '线路',
+            showBufferingMessage: true,
+            onEpisodes: _selectChannel,
+            onSpeed: () async => _toast('直播不支持变速'),
+            onQuality: _selectRoute,
+            onSleepTimer: _showSleepTimer,
+            sleepTimerLabel: _playback.sleepTimer.label,
+            onPrevious: () => _playback.switchBy(-1),
+            onNext: () => _playback.switchBy(1),
+          );
+    return PopScope(
+      canPop: television,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop && !television) {
+          _liveBack();
+        }
+      },
+      child: Scaffold(
+        backgroundColor: Colors.black,
+        body: Theme(
+          data: AppTheme.dark,
+          child: Stack(
+            fit: StackFit.expand,
+            children: [
+              if (widget.videoBuilder != null)
+                widget.videoBuilder!(_playback, true)
+              else if (controller != null)
+                Video(
+                  controller: controller,
+                  fit: BoxFit.contain,
+                  wakelock: false,
+                  controls: (_) => const SizedBox.shrink(),
+                ),
+              if (error != null)
+                ColoredBox(
+                  color: Colors.black.withValues(alpha: .82),
+                  child: StatusPanel(
+                    title: '直播暂时中断',
+                    message: error,
+                    icon: Icons.wifi_off_rounded,
+                    action: '重新连接',
+                    onRetry: () => unawaited(_playback.retry()),
+                    secondaryAction: TextButton(
+                      onPressed: _selectChannel,
+                      child: const Text('换个频道'),
+                    ),
+                  ),
+                )
+              else if (_playback.loading)
+                const Center(
+                  child: SizedBox(
+                    width: 38,
+                    height: 38,
+                    child: CircularProgressIndicator(strokeWidth: 3),
+                  ),
+                ),
+              if (error == null) Focus(focusNode: _focus, child: controls),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}

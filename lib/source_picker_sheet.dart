@@ -1,0 +1,748 @@
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+
+import 'app_theme_config.dart';
+import 'neon_glass_kit.dart';
+import 'site_health.dart';
+import 'site_icon.dart';
+import 'site_thumb_cache.dart';
+import 'site_thumb_card.dart';
+
+class SourcePickerEntry {
+  const SourcePickerEntry({
+    required this.id,
+    required this.name,
+    this.deletable = true,
+    this.iconUrls = const [],
+    this.healthTier,
+    this.healthScore,
+  });
+
+  final String id;
+  final String name;
+  final bool deletable;
+
+  /// 调用方给定的站标候选地址（按序尝试）。为空时按 [id] 查 jar 站
+  /// ext 与 py/Go/阅读桥接表派生；都为空则宫格显示图案标，不联网。
+  final List<String> iconUrls;
+
+  /// 站点健康状态档（可选）：非空时卡片角上画四色状态点；为空时
+  /// 若健康库里已有该站记录则按记录档位画点，无记录不画。
+  final SiteHealthTier? healthTier;
+
+  /// 站点健康分（可选）：弹窗开健康排序时优先用它，缺省查健康库。
+  final double? healthScore;
+}
+
+/// 健康状态点的颜色（绿=近期可用、黄=一般或信息不足、
+/// 红=近期失败较多、灰=未知）。
+Color siteHealthTierColor(SiteHealthTier tier) => switch (tier) {
+  SiteHealthTier.good => const Color(0xFF2EAF4F),
+  SiteHealthTier.fair => const Color(0xFFE3A008),
+  SiteHealthTier.bad => const Color(0xFFD64541),
+  SiteHealthTier.unknown => const Color(0xFF9E9E9E),
+};
+
+class SourcePickerGroup {
+  const SourcePickerGroup({
+    required this.title,
+    required this.entries,
+    this.zone = zoneImport,
+  });
+
+  final String title;
+  final List<SourcePickerEntry> entries;
+
+  /// 两区翻页分区：import=导入区（本地导入 + 远程配置 + 原生功能
+  /// 站），plugin=插件区（已安装的 idj 插件站）。2026-11-26 空壳
+  /// 片库定版：「内置区」已随内置站剥离撤除，不再有 builtin 分区。
+  /// 默认 import；直播/阅读弹窗不分区，不传即全进导入区、不翻页。
+  static const zoneImport = 'import';
+  static const zonePlugin = 'plugin';
+
+  final String zone;
+}
+
+class _EditableGroup {
+  _EditableGroup(this.title, this.entries, {this.zone = ''});
+
+  final String title;
+  final List<SourcePickerEntry> entries;
+  final String zone;
+}
+
+Future<String?> showSitePickerDialog(
+  BuildContext context, {
+  required String sectionName,
+  required String currentId,
+  required List<SourcePickerGroup> groups,
+  bool initialEditMode = false,
+  Future<bool> Function(SourcePickerEntry entry)? onDeleteSite,
+
+  /// 非空时弹窗顶部右上角显示 + 号导入钮：点 + 先关弹窗、再调
+  /// 此回调（调用方打开导入分流、导完刷新站源）。不传则无 + 号
+  /// （直播/阅读区不传，只在片库区接导入）。
+  Future<void> Function()? onImport,
+
+  /// 两区开关（只在片库区传 true）：导入区 / 插件区
+  /// 用翻页滑动切换；不传时保持原来的单列表。
+  bool enableZoneFlip = false,
+
+  /// 站内随机视频缩图（只在片库区传）：缩图地址缓存 +
+  /// 拉首页取封面的回调；两个都传才拉缩图，只传一个不拉。
+  /// 不传时卡片只显示站标（直播/阅读弹窗）。
+  SiteThumbCache? thumbCache,
+  SiteThumbFetcher? thumbFetcher,
+
+  /// 缩图图片文件缓存：测试注入用；不传用 [SiteIconCache.instance]。
+  SiteIconCache? thumbImageCache,
+
+  /// 打开时默认显示的区：0 导入区，1 插件区。导入成功后
+  /// 调用方重开弹窗传对应区号，列表自动落到新装站所在的区。
+  int initialZoneIndex = 0,
+
+  /// 打开时自动滚到的站 id（不传则滚到当前站）。导入成功后调用方
+  /// 重开弹窗传新站 id，列表自动滚到新装的站；选中高亮仍以
+  /// currentId 为准。
+  String? scrollToId,
+
+  /// 按健康分重排组内站点（默认关，保持调用方给的配置顺序）。
+  bool sortByHealth = false,
+}) => showDialog<String>(
+  context: context,
+  builder: (context) => SitePickerDialog(
+    sectionName: sectionName,
+    currentId: currentId,
+    groups: groups,
+    initialEditMode: initialEditMode,
+    onDeleteSite: onDeleteSite,
+    onImport: onImport,
+    enableZoneFlip: enableZoneFlip,
+    initialZoneIndex: initialZoneIndex,
+    scrollToId: scrollToId,
+    thumbCache: thumbCache,
+    thumbFetcher: thumbFetcher,
+    thumbImageCache: thumbImageCache,
+    sortByHealth: sortByHealth,
+  ),
+);
+
+class SitePickerDialog extends StatefulWidget {
+  const SitePickerDialog({
+    super.key,
+    required this.sectionName,
+    required this.currentId,
+    required this.groups,
+    this.initialEditMode = false,
+    this.onDeleteSite,
+    this.onImport,
+    this.enableZoneFlip = false,
+    this.initialZoneIndex = 0,
+    this.scrollToId,
+    this.thumbCache,
+    this.thumbFetcher,
+    this.thumbImageCache,
+    this.sortByHealth = false,
+  });
+
+  final String sectionName;
+  final String currentId;
+  final List<SourcePickerGroup> groups;
+
+  /// 按健康分降序重排组内站点（稳定排序）；默认关 = 配置顺序。
+  final bool sortByHealth;
+  final bool initialEditMode;
+  final Future<bool> Function(SourcePickerEntry entry)? onDeleteSite;
+  final Future<void> Function()? onImport;
+  final bool enableZoneFlip;
+  final int initialZoneIndex;
+
+  /// 站内随机视频缩图：缓存 + 拉首页回调，两个都传才拉；
+  /// 不传时卡片只显示站标。
+  final SiteThumbCache? thumbCache;
+  final SiteThumbFetcher? thumbFetcher;
+
+  /// 缩图图片文件缓存：测试注入用；不传用 [SiteIconCache.instance]。
+  final SiteIconCache? thumbImageCache;
+
+  /// 打开时自动滚到的站：默认是当前站；调用方传 [scrollToId] 时
+  /// 滚到那个站（导入成功后重开弹窗定位新站用），选中高亮仍以
+  /// [currentId] 为准，不把定位站误标成当前站。
+  final String? scrollToId;
+
+  @override
+  State<SitePickerDialog> createState() => _SitePickerDialogState();
+}
+
+class _SitePickerDialogState extends State<SitePickerDialog> {
+  final _searchController = TextEditingController();
+  final _currentKey = GlobalKey();
+  String _query = '';
+  bool _scrolledToCurrent = false;
+  int _scrollSteps = 0;
+  double _lastMaxExtent = -1;
+  late bool _editMode;
+  late List<_EditableGroup> _groups;
+
+  /// 两区：0 导入区，1 插件区；每区一个滚动控制器
+  ///（切换过渡期两区列表同时在树里，共用一个控制器会断言失败）。
+  late int _zoneIndex;
+  final _zoneScrollControllers = [ScrollController(), ScrollController()];
+
+  /// 最近一次翻页方向：+1 往后翻（导入→插件），-1 往前翻。
+  /// 翻页滑动按这个方向滑，翻页才有“往哪边翻”的感觉。
+  int _flipDirection = 1;
+
+  /// 翻页只在片库区开：调用方传 enableZoneFlip 才翻；直播/阅读
+  /// 弹窗不传，永远是原来的单列表。
+  bool get _flipEnabled => widget.enableZoneFlip;
+
+  /// 区号 → 区签：0 导入，1 插件。
+  static const _zoneNames = [
+    SourcePickerGroup.zoneImport,
+    SourcePickerGroup.zonePlugin,
+  ];
+
+  List<_EditableGroup> _zoneGroups(int zone) => [
+    for (final group in _groups)
+      if (group.zone == _zoneNames[zone]) group,
+  ];
+
+  int _zoneEntryCount(int zone) =>
+      _zoneGroups(zone).fold(0, (sum, group) => sum + group.entries.length);
+
+  ScrollController get _activeScrollController =>
+      _zoneScrollControllers[_flipEnabled ? _zoneIndex : 0];
+
+  @override
+  void initState() {
+    super.initState();
+    _editMode = widget.initialEditMode && widget.onDeleteSite != null;
+    _zoneIndex = widget.initialZoneIndex.clamp(0, 1);
+    _groups = [
+      for (final group in widget.groups)
+        _EditableGroup(
+          group.title,
+          widget.sortByHealth
+              ? stableHealthSort(
+                  List.of(group.entries),
+                  (entry) =>
+                      entry.healthScore ??
+                      SiteHealthStore.instance.scoreOf(entry.id),
+                )
+              : List.of(group.entries),
+          // 没写区签的组（旧调用方）一律算导入区，不丢进任何区外。
+          zone: group.zone.isEmpty ? SourcePickerGroup.zoneImport : group.zone,
+        ),
+    ];
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToCurrent());
+  }
+
+  /// 切区：点区签或左右滑触发；切完重定位当前站（在新区里才滚）。
+  void _setZone(int index) {
+    if (!_flipEnabled || index == _zoneIndex || index < 0 || index > 1) {
+      return;
+    }
+    _flipDirection = index > _zoneIndex ? 1 : -1;
+    setState(() {
+      _zoneIndex = index;
+      _scrolledToCurrent = false;
+      _scrollSteps = 0;
+      _lastMaxExtent = -1;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToCurrent());
+  }
+
+  /// 打开弹窗自动滚到当前选中的站（或调用方指定的定位站）。
+  /// 宫格列表一次全建出来，选中行首帧就在树里，直接 ensureVisible；
+  /// 没建出来时按视口步进往下跳、直到它出现再 ensureVisible；
+  /// 到底且范围不再变就放弃。
+  void _scrollToCurrent() {
+    if (_scrolledToCurrent || !mounted || _scrollSteps >= 80) return;
+    final targetId = widget.scrollToId ?? widget.currentId;
+    // 当前站不在活动区时不滚（插件区打开时当前站多半在导入区）。
+    if (_flipEnabled) {
+      final inZone = _zoneGroups(
+        _zoneIndex,
+      ).any((group) => group.entries.any((entry) => entry.id == targetId));
+      if (!inZone) return;
+    }
+    final targetContext = _currentKey.currentContext;
+    if (targetContext != null) {
+      _scrolledToCurrent = true;
+      Scrollable.ensureVisible(
+        targetContext,
+        alignment: 0.2,
+        duration: const Duration(milliseconds: 250),
+      );
+      return;
+    }
+    _scrollSteps++;
+    if (_activeScrollController.hasClients) {
+      final position = _activeScrollController.position;
+      final max = position.maxScrollExtent;
+      if (position.pixels < max) {
+        _activeScrollController.jumpTo(
+          math.min(position.pixels + position.viewportDimension, max),
+        );
+        _lastMaxExtent = max;
+      } else if (max == _lastMaxExtent) {
+        return;
+      } else {
+        _lastMaxExtent = max;
+      }
+    }
+    WidgetsBinding.instance.addPostFrameCallback((_) => _scrollToCurrent());
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    for (final controller in _zoneScrollControllers) {
+      controller.dispose();
+    }
+    super.dispose();
+  }
+
+  /// + 号：先关弹窗（回 null，调用方不切站），再调导入回调。
+  /// 回调是调用方的闭包、用调用方的 context 打开导入分流，
+  /// 本弹窗已关、不存在旧分组过期问题。
+  Future<void> _onAddPressed() async {
+    final handler = widget.onImport;
+    if (handler == null) return;
+    Navigator.pop(context);
+    await handler();
+  }
+
+  Future<void> _delete(SourcePickerEntry entry) async {
+    final handler = widget.onDeleteSite;
+    if (handler == null) return;
+    final deleted = await handler(entry);
+    if (!mounted || !deleted) return;
+    setState(() {
+      for (final group in _groups) {
+        group.entries.removeWhere((item) => item.id == entry.id);
+      }
+      _groups.removeWhere((group) => group.entries.isEmpty);
+    });
+  }
+
+  /// 长按可删：站本身可删、且调用方给了删除回调（片库区）。
+  /// 与编辑模式删除图标是同一条件、同一 [_delete] 入口；调用方
+  /// 的 handler 自己会弹确认框（导入站删文件、原生站隐藏）。
+  bool _canDelete(SourcePickerEntry entry) =>
+      entry.deletable && widget.onDeleteSite != null;
+
+  /// 状态点档位：条目自带优先；没带时健康库里有该站记录才画点
+  /// （按记录档位），完全没学过的站不画（不给全站铺灰点）。
+  SiteHealthTier? _healthTierOf(SourcePickerEntry entry) {
+    if (entry.healthTier != null) return entry.healthTier;
+    final store = SiteHealthStore.instance;
+    if (store.recordOf(entry.id) == null) return null;
+    return store.tierOf(entry.id);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final searching = _query.isNotEmpty;
+    // 翻页开时只取活动区的分组；不开时全取，与原来一致。
+    final zoneGroups = _flipEnabled ? _zoneGroups(_zoneIndex) : _groups;
+    final visible = <({String title, List<SourcePickerEntry> entries})>[];
+    for (final group in zoneGroups) {
+      final entries = searching
+          ? group.entries
+                .where((entry) => entry.name.toLowerCase().contains(_query))
+                .toList()
+          : group.entries;
+      if (entries.isEmpty) continue;
+      visible.add((title: group.title, entries: entries));
+    }
+    return Dialog(
+      key: const ValueKey('site-picker-dialog'),
+      backgroundColor: colors.surface,
+      insetPadding: const EdgeInsets.symmetric(horizontal: 24, vertical: 48),
+      child: ConstrainedBox(
+        constraints: BoxConstraints(
+          maxWidth: 560,
+          maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+        ),
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '切换${widget.sectionName}源',
+                      style: theme.textTheme.titleMedium,
+                    ),
+                  ),
+                  if (widget.onImport != null) ...[
+                    const SizedBox(width: 8),
+                    IconButton.filled(
+                      key: const ValueKey('site-picker-add'),
+                      tooltip: '导入站点',
+                      onPressed: _onAddPressed,
+                      icon: const Icon(Icons.add_rounded),
+                    ),
+                  ],
+                ],
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                key: const ValueKey('site-picker-search'),
+                controller: _searchController,
+                onChanged: (value) =>
+                    setState(() => _query = value.trim().toLowerCase()),
+                decoration: InputDecoration(
+                  hintText: '搜索站点名称',
+                  prefixIcon: const Icon(Icons.search),
+                  suffixIcon: _query.isEmpty
+                      ? null
+                      : IconButton(
+                          icon: const Icon(Icons.clear),
+                          onPressed: () {
+                            _searchController.clear();
+                            setState(() => _query = '');
+                          },
+                        ),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(14),
+                    borderSide: BorderSide.none,
+                  ),
+                  contentPadding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 8,
+                  ),
+                ),
+              ),
+              if (_editMode) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '编辑模式：点删除图标可删除站点',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colors.onSurfaceVariant,
+                  ),
+                ),
+              ] else if (widget.onDeleteSite != null) ...[
+                const SizedBox(height: 8),
+                Text(
+                  '长按站点可删除',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: colors.onSurfaceVariant,
+                  ),
+                ),
+              ],
+              if (_flipEnabled) ...[
+                _zoneTabs(theme, colors),
+                const SizedBox(height: 8),
+              ],
+              const SizedBox(height: 8),
+              Expanded(
+                child: _flipEnabled
+                    ? GestureDetector(
+                        // 左右滑切区：左滑进下一区（导入→插件），
+                        // 右滑回上一区；到头再滑不翻。
+                        onHorizontalDragEnd: (details) {
+                          final velocity = details.primaryVelocity ?? 0;
+                          if (velocity < -80) {
+                            _setZone(_zoneIndex + 1);
+                          } else if (velocity > 80) {
+                            _setZone(_zoneIndex - 1);
+                          }
+                        },
+                        child: AnimatedSwitcher(
+                          duration: const Duration(milliseconds: 280),
+                          // 翻页滑动：新区从行进方向那侧滑进来、
+                          // 旧区向反方向滑出去（AnimatedSwitcher
+                          // 对出场子项反向跑同一 builder）。
+                          // 前翻（_flipDirection=1）新区从右侧滑入，
+                          // 后翻从左侧滑入；时长 280ms 不变。
+                          transitionBuilder: (child, animation) =>
+                              SlideTransition(
+                                position: Tween<Offset>(
+                                  begin: Offset(
+                                      _flipDirection.toDouble(), 0),
+                                  end: Offset.zero,
+                                ).animate(animation),
+                                child: child,
+                              ),
+                          child: KeyedSubtree(
+                            key: ValueKey('site-picker-zone-$_zoneIndex'),
+                            child: _listBody(visible, searching),
+                          ),
+                        ),
+                      )
+                    : _listBody(visible, searching),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  if (_editMode)
+                    TextButton(
+                      key: const ValueKey('site-picker-done'),
+                      onPressed: () => setState(() => _editMode = false),
+                      child: const Text('完成'),
+                    ),
+                  const Spacer(),
+                  OutlinedButton(
+                    key: const ValueKey('site-picker-close'),
+                    onPressed: () => Navigator.pop(context),
+                    child: const Text('关闭'),
+                  ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 列表区本体（翻页与不翻页共用）：空态 / 宫格列表。
+  /// 导入区空时给去处提示，不留白屏。
+  Widget _listBody(
+    List<({String title, List<SourcePickerEntry> entries})> visible,
+    bool searching,
+  ) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    if (visible.isEmpty) {
+      final emptyText = _flipEnabled && !searching
+          ? switch (_zoneIndex) {
+              0 => '导入区还没有站，点右上角 + 导入一个',
+              1 => '插件区还没有站，去小程序「插件」tab 安装一个',
+              _ => '没有匹配的站点',
+            }
+          : '没有匹配的站点';
+      return Center(
+        child: Text(
+          emptyText,
+          style: theme.textTheme.bodyMedium?.copyWith(
+            color: colors.onSurfaceVariant,
+          ),
+        ),
+      );
+    }
+    return ListView(
+      controller: _activeScrollController,
+      children: [
+        for (final group in visible) ...[
+          if (!searching && group.title.isNotEmpty)
+            NeonSectionTitle(
+              // 组标题纯文本「名 + 空格 + 数」，不用括号（设计 §5.4）。
+              '${group.title} ${group.entries.length}',
+              padding: const EdgeInsets.only(top: 12, bottom: 4),
+            ),
+          _siteGrid(group),
+        ],
+      ],
+    );
+  }
+
+  /// 区签栏：导入区 / 插件区（带站数），在翻页区外面——
+  /// 翻页时区签与顶栏 + 号都不动，只有下面的列表翻。
+  Widget _zoneTabs(ThemeData theme, ColorScheme colors) {
+    const labels = ['导入区', '插件区'];
+    const keys = ['site-picker-zone-import', 'site-picker-zone-plugin'];
+    final config = AppThemeConfig.of(context);
+    Widget tab(int index, String label) {
+      final selected = _zoneIndex == index;
+      final count = _zoneEntryCount(index);
+      return Expanded(
+        child: InkWell(
+          key: ValueKey(keys[index]),
+          borderRadius: BorderRadius.circular(10),
+          onTap: () => _setZone(index),
+          child: Container(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            decoration: BoxDecoration(
+              color: selected
+                  ? config.primaryColor
+                  : colors.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(10),
+            ),
+            alignment: Alignment.center,
+            child: Text(
+              '$label（$count）',
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: selected ? config.selectedText : config.unselectedText,
+                fontWeight: selected ? FontWeight.w600 : null,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Row(
+      children: [
+        for (var i = 0; i < labels.length; i++) ...[
+          if (i > 0) const SizedBox(width: 8),
+          tab(i, labels[i]),
+        ],
+      ],
+    );
+  }
+
+  /// 网格卡片：每站一张图卡（站内随机视频缩图 + 站名），
+  /// 每行固定三张卡，图是 16:9 小平图（无 3D 效果）。
+  /// 失效站点拉不到缩图时卡片只显示站标，不挂假图。
+  Widget _siteGrid(({String title, List<SourcePickerEntry> entries}) group) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final width = constraints.maxWidth;
+        const columns = 3;
+        const crossSpacing = 8.0;
+        // 卡高 = 缩图高（16:9）+ 站名区：随列宽缩放，窄屏不溢出。
+        final cardWidth = (width - crossSpacing * (columns - 1)) / columns;
+        final mainAxisExtent = cardWidth * 9 / 16 + 40;
+        return GridView.builder(
+          shrinkWrap: true,
+          physics: const NeverScrollableScrollPhysics(),
+          gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+            crossAxisCount: columns,
+            mainAxisSpacing: 10,
+            crossAxisSpacing: crossSpacing,
+            mainAxisExtent: mainAxisExtent,
+          ),
+          itemCount: group.entries.length,
+          itemBuilder: (context, index) => _siteGridTile(group.entries[index]),
+        );
+      },
+    );
+  }
+
+  /// 站点图卡：上面是 16:9 缩图（站内随机视频封面；拉不到、
+  /// 超时、没封面时显示站标），下面是站名。点卡进站
+  ///（pop 回站 id，与旧文字芯片点行完全一致）。
+  Widget _siteGridTile(SourcePickerEntry entry) {
+    final theme = Theme.of(context);
+    final colors = theme.colorScheme;
+    final config = AppThemeConfig.of(context);
+    final selected = entry.id == widget.currentId;
+    final showDelete = _editMode && _canDelete(entry);
+    return InkWell(
+      key: ValueKey('site-picker-row-${entry.id}'),
+      borderRadius: BorderRadius.circular(12),
+      onTap: _editMode ? null : () => Navigator.pop(context, entry.id),
+      onLongPress: _canDelete(entry) ? () => _delete(entry) : null,
+      child: Container(
+        key: selected ? _currentKey : null,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            AspectRatio(
+              aspectRatio: 16 / 9,
+              child: Stack(
+                clipBehavior: Clip.none,
+                children: [
+                  Container(
+                    decoration: BoxDecoration(
+                      borderRadius: BorderRadius.circular(12),
+                      border: selected
+                          ? Border.all(color: config.primaryColor, width: 2)
+                          : null,
+                      boxShadow: selected ? [neonGlow(config)] : null,
+                    ),
+                    child: SiteThumbImage(
+                      siteId: entry.id,
+                      siteName: entry.name,
+                      iconUrls: entry.iconUrls,
+                      thumbCache: widget.thumbCache,
+                      thumbFetcher: widget.thumbFetcher,
+                      imageCache: widget.thumbImageCache,
+                      borderRadius: 12,
+                    ),
+                  ),
+                  if (!_editMode && selected)
+                    Positioned(
+                      top: -4,
+                      right: -4,
+                      child: Container(
+                        width: 20,
+                        height: 20,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: config.primaryColor,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: colors.surface, width: 2),
+                        ),
+                        child: Icon(
+                          Icons.check,
+                          size: 13,
+                          color: config.selectedText,
+                        ),
+                      ),
+                    ),
+                  if (_healthTierOf(entry) != null)
+                    Positioned(
+                      top: 6,
+                      left: 6,
+                      child: Container(
+                        key: ValueKey('site-picker-health-dot-${entry.id}'),
+                        width: 10,
+                        height: 10,
+                        decoration: BoxDecoration(
+                          color: siteHealthTierColor(_healthTierOf(entry)!),
+                          shape: BoxShape.circle,
+                          border: Border.all(color: colors.surface, width: 1.5),
+                        ),
+                      ),
+                    ),
+                  if (showDelete)
+                    Positioned(
+                      top: -8,
+                      right: -8,
+                      child: Container(
+                        width: 28,
+                        height: 28,
+                        alignment: Alignment.center,
+                        decoration: BoxDecoration(
+                          color: colors.surface,
+                          shape: BoxShape.circle,
+                          border: Border.all(color: colors.error),
+                        ),
+                        child: IconButton(
+                          key: ValueKey('site-picker-delete-${entry.id}'),
+                          padding: EdgeInsets.zero,
+                          style: IconButton.styleFrom(
+                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                          ),
+                          icon: const Icon(Icons.delete_outline, size: 17),
+                          color: colors.error,
+                          onPressed: () => _delete(entry),
+                        ),
+                      ),
+                    ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              entry.name,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: theme.textTheme.bodyMedium?.copyWith(
+                // 长站名缩小字号换行显示（与旧芯片同一阈值）。
+                fontSize: entry.name.length > 12
+                    ? 9.5
+                    : entry.name.length > 8
+                    ? 10.5
+                    : 12,
+                color: selected ? config.primaryColor : config.unselectedText,
+                fontWeight: selected ? FontWeight.w600 : null,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
