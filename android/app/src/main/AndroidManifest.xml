@@ -1,0 +1,235 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- 换图标兜底：桌面快捷方式。ShortcutManagerCompat 在老版本安卓上
+         走传统广播固定快捷方式，需要这个普通权限（无需动态申请）；
+         新版本走系统固定快捷方式流程，不用它。 -->
+    <uses-permission android:name="com.android.launcher.permission.INSTALL_SHORTCUT"/>
+    <!-- 2026-11-20 MYTV 绑定：女优库绑定手机根目录 MYTV 文件夹，根目录读写要
+         “所有文件访问权限”（MANAGE_EXTERNAL_STORAGE）；没授权时 App 降级回
+         内部存储继续用，不硬要权限。 -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>
+    <uses-feature android:name="android.software.leanback" android:required="false"/>
+    <uses-feature android:name="android.hardware.touchscreen" android:required="false"/>
+    <uses-feature android:name="android.hardware.faketouch" android:required="false"/>
+    <application
+        android:label="${appLabel}"
+        android:name="${applicationName}"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:banner="${appBanner}"
+        android:usesCleartextTraffic="true"
+        android:allowBackup="false">
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:taskAffinity=""
+            android:theme="@style/LaunchTheme"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:hardwareAccelerated="true"
+            android:supportsPictureInPicture="true"
+            android:windowSoftInputMode="adjustResize">
+            <property android:name="android.window.PROPERTY_COMPAT_ALLOW_RESTRICTED_RESIZABILITY"
+                android:value="true"/>
+            <meta-data android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme"/>
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:scheme="content" android:host="*" android:mimeType="text/x-python"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/x-python"/>
+                <data android:scheme="content" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.py"/>
+                <data android:scheme="file" android:host="*" android:mimeType="text/x-python"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/x-python"/>
+                <data android:scheme="file" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.py"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="text/x-python"/>
+                <data android:mimeType="application/x-python"/>
+                <data android:mimeType="text/plain"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/java-archive"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/x-java-archive"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/octet-stream" android:pathPattern=".*\\.jar"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/java-archive"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/x-java-archive"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/octet-stream" android:pathPattern=".*\\.jar"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="application/java-archive"/>
+                <data android:mimeType="application/x-java-archive"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/json"/>
+                <data android:scheme="content" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.json"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/json"/>
+                <data android:scheme="file" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.json"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <data android:mimeType="application/json"/>
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="content" android:host="*" android:mimeType="text/x-python"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/x-python"/>
+                <data android:scheme="content" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.py"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.py"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.PY"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/java-archive"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/x-java-archive"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/octet-stream" android:pathPattern=".*\\.jar"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.jar"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.JAR"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/zip"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/x-zip-compressed"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/octet-stream" android:pathPattern=".*\\.zip"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.zip"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.ZIP"/>
+                <data android:scheme="content" android:host="*" android:mimeType="application/json"/>
+                <data android:scheme="content" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.json"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.json"/>
+                <data android:scheme="content" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.JSON"/>
+                <data android:scheme="file" android:host="*" android:mimeType="text/x-python"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/x-python"/>
+                <data android:scheme="file" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.py"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.py"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.PY"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/java-archive"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/x-java-archive"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/octet-stream" android:pathPattern=".*\\.jar"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.jar"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.JAR"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/zip"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/x-zip-compressed"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/octet-stream" android:pathPattern=".*\\.zip"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.zip"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.ZIP"/>
+                <data android:scheme="file" android:host="*" android:mimeType="application/json"/>
+                <data android:scheme="file" android:host="*" android:mimeType="text/plain" android:pathPattern=".*\\.json"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.json"/>
+                <data android:scheme="file" android:host="*" android:mimeType="*/*" android:pathPattern=".*\\.JSON"/>
+            </intent-filter>
+        </activity>
+        <!-- 备选应用图标：默认关闭，设置里换图标时由 IconSwitchBridge 启用其中一个、
+             同时停用主 Activity 的启动入口；切回默认则反向操作。别名类名与
+             lib/app_icon_switcher.dart 的 aliasSuffix 一一对应，改一处必须改另一处。 -->
+        <activity-alias
+            android:name=".IconAntFlame"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_ant_flame"
+            android:roundIcon="@mipmap/ic_launcher_ant_flame"
+            android:label="${appLabel}"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconAntLens"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_ant_lens"
+            android:roundIcon="@mipmap/ic_launcher_ant_lens"
+            android:label="${appLabel}"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconAntWin12"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_ant_win12"
+            android:roundIcon="@mipmap/ic_launcher_ant_win12"
+            android:label="${appLabel}"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconAntStorm"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_ant_storm"
+            android:roundIcon="@mipmap/ic_launcher_ant_storm"
+            android:label="${appLabel}"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <activity-alias
+            android:name=".IconAntMeadow"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_ant_meadow"
+            android:roundIcon="@mipmap/ic_launcher_ant_meadow"
+            android:label="${appLabel}"
+            android:targetActivity=".MainActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity-alias>
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths"/>
+        </provider>
+        <service android:name="com.pravera.flutter_foreground_task.service.ForegroundService"
+            android:foregroundServiceType="dataSync|mediaPlayback" android:exported="false" android:stopWithTask="false"/>
+        <service android:name=".FloatingBallService"
+            android:exported="false" android:stopWithTask="false"/>
+        <service android:name=".AudioCapsuleService"
+            android:exported="false"/>
+        <meta-data android:name="flutterEmbedding" android:value="2"/>
+    </application>
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- 朗读(TTS)：Android 11+ 有包可见性限制，不声明这条就查不到系统
+             语音引擎，speak 会静默失败（点了没声音）。 -->
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE"/>
+        </intent>
+    </queries>
+</manifest>

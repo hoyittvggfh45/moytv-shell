@@ -1,0 +1,676 @@
+package moyi
+
+import io.flutter.embedding.android.FlutterActivity
+import android.app.UiModeManager
+import android.app.ActivityManager
+import android.app.PictureInPictureParams
+import android.os.Build
+import android.os.Bundle
+import android.os.BatteryManager
+import android.os.PowerManager
+import android.os.SystemClock
+import android.content.ComponentName
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.ActivityInfo
+import android.content.pm.PackageManager
+import android.content.res.Configuration
+import android.graphics.Rect
+import android.net.Uri
+import android.util.Rational
+import android.view.InputDevice
+import android.view.WindowManager
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterShellArgs
+import io.flutter.plugin.common.MethodChannel
+
+class MainActivity : FlutterActivity() {
+    private var headroomReadAt = 0L
+    private var thermalHeadroom: Double? = null
+    private var deviceChannel: MethodChannel? = null
+    private var pyBridge: PyBridge? = null
+    private var pyChannel: MethodChannel? = null
+    private var quickJSBridge: QuickJSBridge? = null
+    private var quickJSChannel: MethodChannel? = null
+    private var pyImportChannel: MethodChannel? = null
+    private var pluginShareChannel: MethodChannel? = null
+    private val pendingPyFiles = mutableListOf<Map<String, Any?>>()
+    private val pendingPluginShareFiles = mutableListOf<Map<String, Any?>>()
+    // 插件分享读流上限：与 Flutter 侧外部导入的 32MB 上限一致。
+    private val maxPluginShareBytes = 32L * 1024 * 1024
+    private val pendingJarFiles = mutableListOf<Map<String, Any?>>()
+    // 分享来的 JSON 文件暂存队列（kind=json）：与 py/jar 旧队列同一条
+    // takePending 通道取走，Flutter 侧按 kind 分流，不走插件安装。
+    private val pendingJsonFiles = mutableListOf<Map<String, Any?>>()
+    private var televisionMode = false
+
+    // 导出另存（saveFileToUserLocation）：系统保存框是异步的，
+    // 先把通道回调与源文件路径挂起，等 onActivityResult 回来
+    // 再流式拷贝。同一时间只允许一个（再来一个直接报忙）。
+    private var pendingSaveResult: MethodChannel.Result? = null
+    private var pendingSaveSourcePath: String? = null
+    private val requestCodeSaveFile = 0x4D59
+
+    // 播放页左半屏竖向拖动临时调亮度：只改本窗口 screenBrightness（-1f 表示跟随系统），
+    // 不动系统全局亮度设置，退出播放 reset 后自动恢复，无需 WRITE_SETTINGS 权限。
+    private fun effectiveScreenBrightness(): Double {
+        val local = window.attributes.screenBrightness
+        if (local >= 0f) return local.toDouble()
+        val resolver = contentResolver
+        val system = runCatching {
+            android.provider.Settings.System.getInt(
+                resolver,
+                android.provider.Settings.System.SCREEN_BRIGHTNESS
+            )
+        }.getOrNull()
+        if (system == null) return .5
+        val auto = runCatching {
+            android.provider.Settings.System.getInt(
+                resolver,
+                android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE
+            )
+        }.getOrNull() == android.provider.Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC
+        if (auto) {
+            val autoValue = runCatching {
+                android.provider.Settings.System.getInt(
+                    resolver,
+                    "screen_auto_brightness_adj"
+                )
+            }.getOrNull() ?: 128
+            return (autoValue.coerceIn(0, 255)) / 255.0
+        }
+        return system / 255.0
+    }
+
+    private fun applyScreenBrightness(value: Float) {
+        val attributes = window.attributes
+        attributes.screenBrightness = value.coerceIn(0.01f, 1f)
+        window.attributes = attributes
+    }
+
+    private fun renderingPreferences() =
+        getSharedPreferences("moyi_rendering", Context.MODE_PRIVATE)
+
+    private fun compatibleRendering(): Boolean =
+        renderingPreferences().getBoolean("compatibleRendering", false)
+
+    override fun getFlutterShellArgs(): FlutterShellArgs {
+        val args = super.getFlutterShellArgs()
+        if (compatibleRendering()) args.add("--enable-impeller=false")
+        return args
+    }
+
+    private fun restartApplication() {
+        startActivity(Intent.makeRestartActivityTask(ComponentName(this, MainActivity::class.java)))
+        Runtime.getRuntime().exit(0)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun isTelevisionDevice(): Boolean {
+        val configuration = resources.configuration
+        val mode = (getSystemService(Context.UI_MODE_SERVICE) as? UiModeManager)?.currentModeType
+            ?: (configuration.uiMode and Configuration.UI_MODE_TYPE_MASK)
+        if (mode == Configuration.UI_MODE_TYPE_TELEVISION ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_LEANBACK_ONLY) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_TELEVISION) ||
+            packageManager.hasSystemFeature("amazon.hardware.fire_tv")) {
+            return true
+        }
+        if (mode == Configuration.UI_MODE_TYPE_CAR ||
+            mode == Configuration.UI_MODE_TYPE_WATCH ||
+            mode == Configuration.UI_MODE_TYPE_VR_HEADSET ||
+            configuration.touchscreen != Configuration.TOUCHSCREEN_NOTOUCH ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_SENSOR_ACCELEROMETER) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_AUTOMOTIVE) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_WATCH) ||
+            packageManager.hasSystemFeature(PackageManager.FEATURE_PC)) {
+            return false
+        }
+        val remoteNavigation = configuration.navigation == Configuration.NAVIGATION_DPAD ||
+            InputDevice.getDeviceIds().any { id ->
+                val device = InputDevice.getDevice(id)
+                device != null && !device.isVirtual && device.supportsSource(InputDevice.SOURCE_DPAD)
+            }
+        return remoteNavigation || packageManager.hasSystemFeature(PackageManager.FEATURE_LIVE_TV)
+    }
+
+    override fun setRequestedOrientation(requestedOrientation: Int) {
+        super.setRequestedOrientation(
+            if (televisionMode) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE else requestedOrientation
+        )
+    }
+
+    private fun playbackPower(): Map<String, Any?> {
+        val power = getSystemService(Context.POWER_SERVICE) as? PowerManager
+        val activity = getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+        val battery = registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val now = SystemClock.elapsedRealtime()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+            (headroomReadAt == 0L || now - headroomReadAt >= 10000L)) {
+            headroomReadAt = now
+            thermalHeadroom = runCatching {
+                power?.getThermalHeadroom(0)?.toDouble()?.takeIf { it.isFinite() }
+            }.getOrNull()
+        }
+        val thermalStatus = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            power?.currentThermalStatus ?: PowerManager.THERMAL_STATUS_NONE
+        } else 0
+        return mapOf(
+            "batterySaver" to (power?.isPowerSaveMode ?: false),
+            "onBattery" to ((battery?.getIntExtra(BatteryManager.EXTRA_PLUGGED, -1) ?: -1) <= 0),
+            "thermalStatus" to thermalStatus,
+            "headroom" to thermalHeadroom,
+            "lowMemory" to (activity?.isLowRamDevice ?: true),
+            "gles" to (activity?.deviceConfigurationInfo?.reqGlEsVersion ?: 0)
+        )
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        televisionMode = if (savedInstanceState?.containsKey("moyi.televisionMode") == true) {
+            savedInstanceState.getBoolean("moyi.televisionMode")
+        } else isTelevisionDevice()
+        super.onCreate(savedInstanceState)
+        if (televisionMode) requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            window.isNavigationBarContrastEnforced = false
+            window.isStatusBarContrastEnforced = false
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (televisionMode) requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putBoolean("moyi.televisionMode", televisionMode)
+        super.onSaveInstanceState(outState)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun displayNameFor(uri: Uri): String? {
+        if (uri.scheme != "content") return uri.lastPathSegment?.substringAfterLast('/')
+        return runCatching {
+            contentResolver.query(
+                uri,
+                arrayOf(android.provider.OpenableColumns.DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) cursor.getString(0) else null
+            }
+        }.getOrNull()
+    }
+
+    // 插件分享 URI 队列入队：同一 URI 不重复进。Flutter 侧按 URI
+    // 读流安装（见 plugin_share_intent.dart），这里不拷文件。
+    private fun enqueuePluginShare(uri: Uri, name: String, fallbackName: String, jsonKind: Boolean) {
+        val uriString = uri.toString()
+        if (pendingPluginShareFiles.any { it["uri"] == uriString }) return
+        val entry = mutableMapOf<String, Any?>(
+            "uri" to uriString,
+            "name" to if (name.isNotEmpty()) name else fallbackName,
+        )
+        if (jsonKind) entry["kind"] = "json"
+        pendingPluginShareFiles.add(entry)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun stageIncomingIntent(incoming: Intent?) {
+        if (incoming == null) return
+        val action = incoming.action
+        if (action != Intent.ACTION_VIEW && action != Intent.ACTION_SEND) return
+        // URI 兜底顺序：data / EXTRA_STREAM 都没有时再看 ClipData
+        // 第一条（有些应用只把文件 URI 放在 ClipData 里递过来）。
+        val uri: Uri = when (action) {
+            Intent.ACTION_VIEW -> incoming.data
+            else -> incoming.getParcelableExtra<Uri>(Intent.EXTRA_STREAM) ?: incoming.data
+        } ?: runCatching {
+            incoming.clipData?.let { clip ->
+                if (clip.itemCount > 0) clip.getItemAt(0).uri else null
+            }
+        }.getOrNull() ?: return
+        val name = displayNameFor(uri) ?: uri.lastPathSegment?.substringAfterLast('/') ?: ""
+        val mime = incoming.type ?: runCatching { contentResolver.getType(uri) }.getOrNull()
+        val lowerName = name.lowercase()
+        val looksZip = lowerName.endsWith(".zip") ||
+            mime == "application/zip" || mime == "application/x-zip-compressed"
+        val looksPy = !looksZip && (lowerName.endsWith(".py") ||
+            (!lowerName.endsWith(".jar") &&
+                (mime == "text/x-python" || mime == "application/x-python")))
+        val looksJar = !looksZip && !looksPy && (lowerName.endsWith(".jar") ||
+            mime == "application/java-archive" || mime == "application/x-java-archive")
+        // JSON：只认 .json 后缀或 application/json 类型；text/plain 不带后缀时
+        // 不认（否则所有纯文本分享都会进 JSON 分流）。py/jar/zip 优先于 JSON。
+        val looksJson = !looksZip && !looksPy && !looksJar &&
+            (lowerName.endsWith(".json") || mime == "application/json")
+        // 名字与类型都认不出的不直接丢：意图能递进来，说明命中了
+        // 清单里注册的文件过滤器；先按 URI 暂存进插件分享队列，
+        // 到底是什么文件由 Flutter 侧读内容嗅探后决定。SEND 只有
+        // EXTRA_TEXT、没有 URI 的在上面取不到 URI 已经 return，
+        // 不会把纯文字分享吞进来。
+        val recognized = looksPy || looksJar || looksZip || looksJson
+        if (action == Intent.ACTION_VIEW || !recognized) {
+            // 打开方式进插件分享通道：Flutter 侧按 URI 读流后走插件安装；
+            // 不再同时进旧的 py/jar 暂存队列，避免一次打开装两次。
+            // SEND（分享到）已识别类型仍走旧的暂存队列，行为不变。
+            // JSON 也走这条 URI 队列，但带 kind=json 标记，Flutter 侧按
+            // 内容分流到小程序/书源/配置导入，不进插件安装。
+            // 未识别类型同样走这条队列，不带 kind 标记，Flutter 侧
+            // 读内容嗅探定型（认不出会给用户可见提示，不无声丢弃）。
+            val fallbackName = if (looksZip) "import.zip"
+                else if (looksJar) "import.jar"
+                else if (looksJson) "import.json"
+                else if (looksPy) "import.py" else "import.bin"
+            enqueuePluginShare(uri, name, fallbackName, looksJson)
+            return
+        }
+        // zip 只走打开方式的插件分享通道，SEND 来的 zip 不进旧队列。
+        if (looksZip) return
+        val staged = runCatching {
+            val dirName = if (looksJar) "jarimport" else if (looksJson) "jsonimport" else "pyimport"
+            val dir = java.io.File(cacheDir, dirName).apply { if (!exists()) mkdirs() }
+            val suffix = if (looksJar) "jar" else if (looksJson) "json" else "py"
+            val target = java.io.File(dir, "${System.currentTimeMillis()}_${(0..9999).random()}.$suffix")
+            val copied = contentResolver.openInputStream(uri)?.use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            }
+            if (copied == null) null else target
+        }.getOrNull()
+        if (staged == null) {
+            // 暂存拷贝失败不无声丢弃：退回 URI 队列，让 Flutter 侧
+            // 再读一次；真读不到会给出可见的失败提示。
+            enqueuePluginShare(uri, name, "import.bin", false)
+            return
+        }
+        val entry = mapOf(
+            "path" to staged.absolutePath,
+            "name" to if (name.isNotEmpty()) name else if (looksJar) "import.jar" else if (looksJson) "import.json" else "import.py",
+            "size" to staged.length(),
+            "kind" to if (looksJar) "jar" else if (looksJson) "json" else "py"
+        )
+        if (looksJar) pendingJarFiles.add(entry)
+        else if (looksJson) pendingJsonFiles.add(entry)
+        else pendingPyFiles.add(entry)
+    }
+
+    // 插件分享读流：Flutter 侧只认 URI + 字节流，不假设文件路径。
+    // 超过 32MB 拒读（与旧的外部导入上限一致），流打不开报 unreadable。
+    private fun readPluginShareBytes(uriString: String, result: MethodChannel.Result) {
+        val uri = runCatching { Uri.parse(uriString) }.getOrNull()
+        if (uri == null) {
+            result.error("invalid_uri", "文件 URI 无效", null)
+            return
+        }
+        try {
+            val bytes = contentResolver.openInputStream(uri)?.use { input ->
+                val output = java.io.ByteArrayOutputStream()
+                val buffer = ByteArray(64 * 1024)
+                var total = 0L
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    total += read
+                    if (total > maxPluginShareBytes) {
+                        throw java.io.IOException("too_large")
+                    }
+                    output.write(buffer, 0, read)
+                }
+                output.toByteArray()
+            }
+            if (bytes == null) {
+                result.error("unreadable", "无法打开文件流", null)
+                return
+            }
+            result.success(bytes)
+        } catch (e: java.io.IOException) {
+            if (e.message == "too_large") {
+                result.error("file_too_large", "文件过大（超过 32MB）", null)
+            } else {
+                result.error("unreadable", "读取文件流失败：${e.message}", null)
+            }
+        } catch (e: Exception) {
+            result.error("unreadable", "读取文件流失败：${e.message}", null)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        stageIncomingIntent(intent)
+    }
+
+    // 导出另存的系统保存框回来：用户取消回 false；选定位置后
+    // 在后台线程流式拷贝（多大的文件都不进内存），拷完回主
+    // 线程交结果。super 照调，Flutter 引擎给插件的分发不受影响。
+    @Deprecated("Deprecated in Java")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode != requestCodeSaveFile) return
+        val pending = pendingSaveResult ?: return
+        val sourcePath = pendingSaveSourcePath
+        pendingSaveResult = null
+        pendingSaveSourcePath = null
+        val uri = data?.data
+        if (resultCode != RESULT_OK || uri == null || sourcePath == null) {
+            pending.success(false)
+            return
+        }
+        Thread {
+            try {
+                val input = java.io.FileInputStream(java.io.File(sourcePath))
+                val output = contentResolver.openOutputStream(uri)
+                    ?: throw java.io.IOException("打不开目标文件")
+                input.use { ins -> output.use { outs -> ins.copyTo(outs) } }
+                runOnUiThread { pending.success(true) }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    pending.error("save_copy_failed", "保存失败：${e.message}", null)
+                }
+            }
+        }.start()
+    }
+
+    override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+        super.configureFlutterEngine(flutterEngine)
+        flutterEngine.plugins.add(VideoSurfacePlugin())
+        flutterEngine.plugins.add(TvboxPlayerPlugin())
+        flutterEngine.plugins.add(IjkPlayerPlugin())
+        JarBridge.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        FloatingWindowPlugin.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        AudioMediaPlugin.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        AudioCapsulePlugin.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        AppUpdateBridge.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        FrameExtractorBridge.register(flutterEngine.dartExecutor.binaryMessenger)
+        IconSwitchBridge.register(flutterEngine.dartExecutor.binaryMessenger, this)
+        val bridge = PyBridge(this)
+        pyBridge = bridge
+        pyChannel = bridge.register(flutterEngine.dartExecutor.binaryMessenger)
+        val quickJS = QuickJSBridge()
+        quickJSBridge = quickJS
+        quickJSChannel = quickJS.register(flutterEngine.dartExecutor.binaryMessenger)
+        deviceChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "moyi/device")
+            .also { channel ->
+                channel.setMethodCallHandler { call, result ->
+                    when (call.method) {
+                        "deviceInfo" -> {
+                            val version = packageManager.getPackageInfo(packageName, 0).versionName
+                            result.success(mapOf("television" to isTelevisionDevice(), "version" to version))
+                        }
+                        "setTelevisionMode" -> {
+                            val enabled = call.argument<Boolean>("enabled")
+                            if (enabled == null) {
+                                result.error("invalid_display_mode", "缺少电视模式状态", null)
+                            } else {
+                                val changed = televisionMode != enabled
+                                televisionMode = enabled
+                                if (enabled || changed) {
+                                    requestedOrientation = if (enabled) {
+                                        ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                                    } else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+                                }
+                                result.success(null)
+                            }
+                        }
+                        "playbackPower" -> result.success(runCatching { playbackPower() }.getOrNull())
+                        // 2026-11-20 MYTV 绑定：女优库绑定手机根目录 MYTV 文件夹用。
+                        // targetSdk 36 下根目录读写要“所有文件访问权限”：
+                        // externalStorageRoot 拿真根目录（鸿蒙卓易通容器里
+                        // 的实际路径也由系统给，不硬编 /storage/emulated/0）；
+                        // hasAllFilesAccess 查授权；openAllFilesSettings
+                        // 打开系统授权页（用户点授权后回 App 点“重新绑定”）。
+                        // 三个调用都只在 API 30+ 有效，低版本回空/false。
+                        "externalStorageRoot" -> result.success(
+                            runCatching {
+                                @Suppress("DEPRECATION")
+                                android.os.Environment.getExternalStorageDirectory().absolutePath
+                            }.getOrNull(),
+                        )
+                        "hasAllFilesAccess" -> result.success(
+                            Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                                android.os.Environment.isExternalStorageManager(),
+                        )
+                        "openAllFilesSettings" -> {
+                            val opened = runCatching {
+                                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
+                                    return@runCatching false
+                                }
+                                val intent = Intent(
+                                    android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                                    Uri.parse("package:$packageName"),
+                                )
+                                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                startActivity(intent)
+                                true
+                            }.getOrElse {
+                                runCatching {
+                                    val intent = Intent(
+                                        android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION,
+                                    )
+                                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                    startActivity(intent)
+                                    true
+                                }.getOrDefault(false)
+                            }
+                            if (opened) {
+                                result.success(null)
+                            } else {
+                                result.error(
+                                    "open_settings_failed",
+                                    "打不开系统设置",
+                                    null,
+                                )
+                            }
+                        }
+                        // 2026-11-26 演员库导出另存：系统保存框
+                        // （ACTION_CREATE_DOCUMENT，免任何存储权限）
+                        // 选位置，原生侧流式拷贝源文件过去——导出
+                        // 文件在应用内部目录里用户拿不到，全靠这条
+                        // 通道送出；多大的文件都不整份进内存。
+                        // 结果在 onActivityResult 里回：true 已保存、
+                        // false 用户取消、error 拷贝失败。
+                        "saveFileToUserLocation" -> {
+                            val sourcePath = call.argument<String>("sourcePath")
+                            val fileName = call.argument<String>("fileName")
+                            if (sourcePath.isNullOrEmpty() || fileName.isNullOrEmpty()) {
+                                result.error("invalid_save_request", "缺少源文件或文件名", null)
+                            } else if (pendingSaveResult != null) {
+                                result.error("save_busy", "上一个保存还没结束", null)
+                            } else {
+                                pendingSaveResult = result
+                                pendingSaveSourcePath = sourcePath
+                                val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                                    addCategory(Intent.CATEGORY_OPENABLE)
+                                    type = "*/*"
+                                    putExtra(Intent.EXTRA_TITLE, fileName)
+                                }
+                                try {
+                                    @Suppress("DEPRECATION")
+                                    startActivityForResult(intent, requestCodeSaveFile)
+                                } catch (e: Exception) {
+                                    pendingSaveResult = null
+                                    pendingSaveSourcePath = null
+                                    result.error("save_launch_failed", "打不开系统保存框", null)
+                                }
+                            }
+                        }
+                        "signatureSha256" -> result.success(signatureSha256())
+                        "compatibleRendering" -> result.success(compatibleRendering())
+                        "setCompatibleRendering" -> {
+                            val enabled = call.argument<Boolean>("enabled")
+                            if (enabled == null) {
+                                result.error("invalid_rendering_mode", "缺少兼容渲染模式状态", null)
+                            } else if (!renderingPreferences().edit()
+                                    .putBoolean("compatibleRendering", enabled).commit()) {
+                                result.error("rendering_mode_not_saved", "兼容渲染模式未能保存", null)
+                            } else {
+                                result.success(null)
+                                restartApplication()
+                            }
+                        }
+                        "pictureInPictureStatus" -> result.success(pictureInPictureStatus())
+                        "screenBrightness" -> result.success(effectiveScreenBrightness())
+                        "setScreenBrightness" -> {
+                            val value = call.argument<Double>("value")
+                            if (value == null || value.isNaN() || value.isInfinite()) {
+                                result.error("invalid_brightness", "缺少亮度值", null)
+                            } else {
+                                applyScreenBrightness(value.toFloat())
+                                result.success(null)
+                            }
+                        }
+                        "resetScreenBrightness" -> {
+                            val attributes = window.attributes
+                            attributes.screenBrightness =
+                                WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+                            window.attributes = attributes
+                            result.success(null)
+                        }
+                        "enterPictureInPicture" -> {
+                            val width = call.argument<Int>("width") ?: 16
+                            val height = call.argument<Int>("height") ?: 9
+                            result.success(enterPlayerPictureInPicture(
+                                width,
+                                height,
+                                call.argument<Int>("left"),
+                                call.argument<Int>("top"),
+                                call.argument<Int>("right"),
+                                call.argument<Int>("bottom")
+                            ))
+                        }
+                        else -> result.notImplemented()
+                    }
+                }
+            }
+        pyImportChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "moyi/pyimport")
+            .also { channel ->
+                channel.setMethodCallHandler { call, result ->
+                    if (call.method == "takePending") {
+                        val pending = pendingPyFiles.toList() + pendingJarFiles.toList() + pendingJsonFiles.toList()
+                        pendingPyFiles.clear()
+                        pendingJarFiles.clear()
+                        pendingJsonFiles.clear()
+                        result.success(pending)
+                    } else {
+                        result.notImplemented()
+                    }
+                }
+            }
+        pluginShareChannel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "moyi/plugin_share")
+            .also { channel ->
+                channel.setMethodCallHandler { call, result ->
+                    when (call.method) {
+                        "takePending" -> {
+                            val pending = pendingPluginShareFiles.toList()
+                            pendingPluginShareFiles.clear()
+                            result.success(pending)
+                        }
+                        "readBytes" -> {
+                            val uriString = call.argument<String>("uri")
+                            if (uriString.isNullOrEmpty()) {
+                                result.error("invalid_uri", "缺少文件 URI", null)
+                            } else {
+                                readPluginShareBytes(uriString, result)
+                            }
+                        }
+                        else -> result.notImplemented()
+                    }
+                }
+            }
+        // 冷启动的初始 intent 在这里接（configureFlutterEngine 在 onCreate 内跑）；
+        // 热启动走 onNewIntent，两路都进 stageIncomingIntent，不丢。
+        stageIncomingIntent(intent)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun signatureSha256(): String? {
+        return runCatching {
+            val info = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNING_CERTIFICATES)
+            } else {
+                packageManager.getPackageInfo(packageName, PackageManager.GET_SIGNATURES)
+            }
+            val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                info.signingInfo?.apkContentsSigners
+            } else {
+                @Suppress("DEPRECATION") info.signatures
+            } ?: return null
+            val digest = java.security.MessageDigest.getInstance("SHA-256")
+            signatures.firstOrNull()?.let { signature ->
+                digest.digest(signature.toByteArray()).joinToString("") { "%02x".format(it.toInt() and 0xff) }
+            }
+        }.getOrNull()
+    }
+
+    private fun pictureInPictureSupported(): Boolean {
+        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.O &&
+            packageManager.hasSystemFeature(PackageManager.FEATURE_PICTURE_IN_PICTURE)
+    }
+
+    private fun pictureInPictureStatus(): Map<String, Any> {
+        return mapOf(
+            "supported" to pictureInPictureSupported(),
+            "active" to (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N && isInPictureInPictureMode)
+        )
+    }
+
+    private fun enterPlayerPictureInPicture(
+        width: Int,
+        height: Int,
+        left: Int?,
+        top: Int?,
+        right: Int?,
+        bottom: Int?
+    ): Map<String, Any> {
+        if (!pictureInPictureSupported()) return pictureInPictureStatus()
+        val safeWidth = width.coerceIn(1, 10000)
+        val safeHeight = height.coerceIn(1, 10000)
+        return runCatching {
+            val builder = PictureInPictureParams.Builder()
+            builder.setAspectRatio(Rational(safeWidth, safeHeight))
+            if (left != null && top != null && right != null && bottom != null &&
+                right > left && bottom > top) {
+                builder.setSourceRectHint(Rect(left, top, right, bottom))
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                builder.setAutoEnterEnabled(true)
+            }
+            val entered = enterPictureInPictureMode(builder.build())
+            pictureInPictureStatus() + ("requested" to entered)
+        }.getOrElse { pictureInPictureStatus() }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        deviceChannel?.invokeMethod(
+            "pictureInPictureChanged",
+            mapOf("active" to isInPictureInPictureMode)
+        )
+    }
+
+    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
+        deviceChannel?.setMethodCallHandler(null)
+        deviceChannel = null
+        pyImportChannel?.setMethodCallHandler(null)
+        pyImportChannel = null
+        pluginShareChannel?.setMethodCallHandler(null)
+        pluginShareChannel = null
+        pyChannel?.setMethodCallHandler(null)
+        pyChannel = null
+        pyBridge?.shutdown()
+        pyBridge = null
+        quickJSChannel?.setMethodCallHandler(null)
+        quickJSChannel = null
+        quickJSBridge?.shutdown()
+        quickJSBridge = null
+        super.cleanUpFlutterEngine(flutterEngine)
+    }
+}

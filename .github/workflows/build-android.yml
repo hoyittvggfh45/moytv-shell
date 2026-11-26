@@ -1,0 +1,277 @@
+name: build-android
+
+on:
+  workflow_dispatch:
+    inputs:
+      variant:
+        description: "构建版本（moyi = 魔蚁box 全站源，duanjushijie = 短剧视界 仅红果）"
+        type: choice
+        options: [moyi, duanjushijie]
+        default: moyi
+      abi:
+        description: "目标 ABI"
+        type: choice
+        options: [arm64-v8a, armeabi-v7a, x86_64]
+        default: arm64-v8a
+      build_ios:
+        description: "同时构建 iOS 未签名包（macOS 任务，需手动勾选；未签名包装不到真 iPhone，需自行签名后侧载）"
+        type: boolean
+        default: false
+      empty_shell:
+        description: "空壳版（不捆绑 jar/py 插件、不自动装插件；海阔规则与直播不动）"
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-${{ github.ref }}-${{ github.event.inputs.variant || 'moyi' }}-${{ github.event.inputs.empty_shell || 'false' }}
+  cancel-in-progress: true
+
+env:
+  VARIANT: ${{ github.event.inputs.variant || 'moyi' }}
+  ABI: ${{ github.event.inputs.abi || 'arm64-v8a' }}
+  NDK_VERSION: "28.2.13676358"
+  CMAKE_VERSION: "3.22.1"
+  FLUTTER_VERSION: "3.50.0"
+
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 从分片拼回 drpy-node 内置小程序（59MB 大文件走不了接口上传）
+        run: |
+          cat drpy_chunks/com.leospring.drpy_node.zip.part-* > assets/miniapps/builtin/com.leospring.drpy_node.zip
+          ls -l assets/miniapps/builtin/com.leospring.drpy_node.zip
+          echo "6c47c482170f07d9911ff7257405e8f6  assets/miniapps/builtin/com.leospring.drpy_node.zip" | md5sum -c -
+
+      - name: 安装 JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: 安装 Android SDK / NDK / CMake
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          export ANDROID_HOME="$SDK_ROOT"
+          export ANDROID_SDK_ROOT="$SDK_ROOT"
+          SDKMGR="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -x "$SDKMGR" ]; then SDKMGR="$(command -v sdkmanager)"; fi
+          yes | "$SDKMGR" --licenses > /dev/null 2>&1 || true
+          "$SDKMGR" --install \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+          echo "ANDROID_NDK_HOME=$SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK=$SDK_ROOT/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache: true
+          cache-dependency-path: native/go.sum
+
+      - name: 安装 Python 3.11（Chaquopy 编译期内嵌依赖需要本机解释器）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 确认 Chaquopy 使用的 Python
+        run: |
+          set -e
+          PY="$(command -v python3.11 || command -v python3)"
+          "$PY" --version
+          "$PY" -c "import venv, ensurepip; print('venv/ensurepip OK')"
+          echo "CHAQUOPY_BUILD_PYTHON=$PY" >> "$GITHUB_ENV"
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 配置 Gradle 缓存
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: 写入 CI 用的 local.properties
+        run: |
+          set -e
+          SDK_ROOT="${ANDROID_HOME}"
+          FLUTTER_BIN="$(command -v flutter)"
+          FLUTTER_SDK="$(cd "$(dirname "$FLUTTER_BIN")/.." && pwd)"
+          printf 'flutter.sdk=%s\nsdk.dir=%s\n' "$FLUTTER_SDK" "$SDK_ROOT" > android/local.properties
+          cat android/local.properties
+
+      - name: 配置发布签名（未配 Secrets 时自动用 debug 签名出预览包）
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+          python3 scripts/configure_signing.py
+
+      - name: 构建原生库 + APK
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+          GOSUMDB: sum.golang.org
+          CGO_ENABLED: "1"
+          MOYI_EMPTY_SHELL: ${{ github.event.inputs.empty_shell || 'false' }}
+        run: |
+          set -e
+          ARGS="--abi ${ABI}"
+          if [ "$VARIANT" = "moyi" ]; then ARGS="$ARGS --all-sources"; fi
+          echo "构建参数：$ARGS"
+          python3 scripts/build_android.py $ARGS
+
+      - name: 列出产物
+        run: |
+          set -e
+          ls -lh dist/android/ || true
+          cat dist/android/SHA256SUMS.txt || true
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ env.VARIANT }}-${{ env.ABI }}-${{ github.run_number }}
+          path: |
+            dist/android/*.apk
+            dist/android/SHA256SUMS.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 上传构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ github.run_number }}
+          path: |
+            build/logs/**
+            android/.gradle/**
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 发布到 Release（打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/android/*.apk
+            dist/android/SHA256SUMS.txt
+          generate_release_notes: true
+
+  ios:
+    # 未签名 IPA：没有开发者账号/签名证书时装不到真 iPhone，只能用于检查
+    # 编译与包结构，或由用户自行签名后侧载。本任务不做签名（用户未提账号）。
+    # 只在手动触发并勾选 build_ios 时跑，push 触发时跳过，不影响安卓任务。
+    if: ${{ inputs.build_ios }}
+    runs-on: macos-15
+    timeout-minutes: 150
+    concurrency:
+      group: ios-${{ github.ref }}-${{ github.event.inputs.variant || 'moyi' }}
+      cancel-in-progress: true
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 从分片拼回 drpy-node 内置小程序（59MB 大文件走不了接口上传）
+        run: |
+          set -e
+          cat drpy_chunks/com.leospring.drpy_node.zip.part-* > assets/miniapps/builtin/com.leospring.drpy_node.zip
+          ls -l assets/miniapps/builtin/com.leospring.drpy_node.zip
+          test "$(md5 -q assets/miniapps/builtin/com.leospring.drpy_node.zip)" = "6c47c482170f07d9911ff7257405e8f6"
+
+      - name: 安装 Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache: true
+          cache-dependency-path: native/go.sum
+
+      - name: 安装 Python 3.11（备料脚本与 requests 兼容包下载需要本机解释器）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: 确认 CocoaPods
+        run: pod --version
+
+      - name: 准备 iOS Python 运行时（下载 BeeWare 3.13 包 + 挂接工程 + 同步宿主脚本 + 备 requests 兼容包）
+        run: python3 scripts/prepare_ios_python.py
+
+      - name: 构建 Go 核 + iOS 未签名包
+        env:
+          GOPROXY: https://proxy.golang.org,direct
+          GOSUMDB: sum.golang.org
+        run: |
+          set -e
+          ARGS=""
+          if [ "$VARIANT" = "moyi" ]; then ARGS="$ARGS --all-sources"; fi
+          echo "构建参数：$ARGS"
+          python3 scripts/build_ios.py $ARGS
+
+      - name: 检查 IPA 内 Python 运行时
+        run: python3 scripts/check_ios_py_runtime.py dist/ios
+
+      - name: 列出产物
+        run: |
+          set -e
+          ls -lh dist/ios/ || true
+          cat dist/ios/SHA256SUMS.txt || true
+
+      - name: 上传 IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-${{ env.VARIANT }}-unsigned-${{ github.run_number }}
+          path: |
+            dist/ios/*.ipa
+            dist/ios/SHA256SUMS.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: 上传构建日志（失败时）
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build-logs-${{ github.run_number }}
+          path: |
+            build/logs/**
+          retention-days: 7
+          if-no-files-found: ignore
