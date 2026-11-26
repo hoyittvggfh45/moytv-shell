@@ -15,6 +15,8 @@ import 'crosssite_probe.dart';
 import 'crosssite_probe_section.dart';
 import 'ios_dialogs.dart';
 import 'core_bridge.dart';
+import 'cloud_drive/cloud_115_offline.dart';
+import 'cloud_drive/cloud_drive_types.dart';
 import 'local_store.dart';
 import 'models.dart';
 import 'package:media_kit/media_kit.dart';
@@ -38,9 +40,13 @@ import 'tmdb/tmdb_config.dart';
 import 'tmdb/tmdb_metadata.dart';
 import 'tmdb/tmdb_service.dart';
 import 'viewing_experience_settings.dart';
-import 'actress/actress_widgets.dart';
+import 'actress/actress_online_detail.dart';
+import 'actress/actress_online_lines.dart';
+import 'actress/actress_online_sources.dart';
 import 'actress/code_meta_section.dart';
 import 'actress/jav_code_meta.dart';
+import 'actress/javdb_api.dart';
+import 'actress/javdb_image.dart';
 
 typedef DetailTagTap =
     void Function(String sourceId, String tagId, String tagName);
@@ -84,6 +90,8 @@ class DetailScreen extends StatefulWidget {
     this.queue,
     this.playerFactory,
     this.videoBuilder,
+    this.javdbStillsClient,
+    this.pan115Gateway,
   });
   final Drama drama;
   final AppRepository repository;
@@ -122,6 +130,17 @@ class DetailScreen extends StatefulWidget {
   final PlaybackQueue? queue;
   final Player Function()? playerFactory;
   final Widget Function(Widget controls)? videoBuilder;
+
+  /// JavDB 补充链用的接口客户端（剧照补图见 _loadJavdbStills；
+  /// 磁力/评论/信息卡系列与评分见 _loadJavdbExtras）。只供测试/
+  /// 预览注入，不传时用默认客户端走真接口。
+  final JavdbApiClient? javdbStillsClient;
+
+  /// 115 网关（演员库详情页的离线/播放接入，见 _startPan115）：
+  /// 演员库入口构造时由 NativeRepository 注入，登录态走网盘
+  /// 引擎既有 115 登录；不传时 115 区不出现，其余行为不变。
+  /// 只供演员库链与测试注入。
+  final Pan115Gateway? pan115Gateway;
   @override
   State<DetailScreen> createState() => _DetailScreenState();
 }
@@ -153,6 +172,36 @@ class _DetailScreenState extends State<DetailScreen> {
   /// 三站元数据 + who's 索引（与 CodeMetaSection 同一份匹配）。
   /// null = 未匹配到或尚未查完，头区不画演员行。
   CodeMeta? _codeMeta;
+
+  /// JavDB 补充链用的客户端：构造方注入优先，否则本页自建
+  /// 一个（无请求时不产生流量）。
+  late final JavdbApiClient _javdbStillsClient =
+      widget.javdbStillsClient ?? JavdbApiClient();
+
+  /// JavDB 按番号补的磁力（_loadJavdbExtras 填）：空时磁力区
+  /// 不显示。走本页自己的区（点按复制），不并入 _detail.magnets
+  /// ——通用 _magnetSection 的点按口径是「暂不支持播放」提示，
+  /// 与本链的复制口径不合，改它会动通用详情页既有行为。
+  List<MagnetLink> _javdbMagnets = const [];
+
+  /// JavDB 按番号补的评论（_loadJavdbExtras 填）：空时评论区
+  /// 不显示，只读展示。
+  List<JavdbReview> _javdbReviews = const [];
+
+  /// 115 区状态（_startPan115 / _pollPan115 维护）：未登录只
+  /// 显示一行提示；网盘已存该番号文件时出播放行；已自动离
+  /// 线未下完时显示进度，下完转播放行；都没命中整区不显示。
+  bool _pan115LoginHint = false;
+  CloudDriveFile? _pan115File;
+  bool _pan115Submitted = false;
+  double? _pan115Percent;
+
+  /// 已启动过 115 流程（防重复进入）；_pan115Checked 在
+  /// 「已登录且网盘无文件、无在跑任务」确认后置真，磁力到
+  /// 齐后 _maybeSubmitPan115 只在此后才许提交。
+  bool _pan115Started = false;
+  bool _pan115Checked = false;
+  Timer? _pan115Timer;
 
   /// 推荐视频（本站同分类优先）：空时推荐区隐藏，不留空壳。
   List<Drama> _recommended = const [];
@@ -213,6 +262,7 @@ class _DetailScreenState extends State<DetailScreen> {
 
   @override
   void dispose() {
+    _pan115Timer?.cancel();
     _frameService.dispose();
     _detailScroll.dispose();
     widget.store.removeListener(_onStoreChanged);
@@ -249,6 +299,377 @@ class _DetailScreenState extends State<DetailScreen> {
     );
     if (!mounted || generation != _generation) return;
     setState(() => _codeMeta = meta);
+  }
+
+  /// 剧照补图（2026-11-26）：本地库 / who's 等入口打开的作品
+  /// 详情自带剧照为空时，按番号去 JavDB 接口补预览图（番号精
+  /// 确相等才认，见 actressJavdbStillsSupplement）。与
+  /// _refreshCodeMeta 同一处后台补充链：不挡开页、不报错、
+  /// 拉不到保持空、已有剧照不覆盖。JavDB 入口的作品开页时
+  /// 已按作品 id 拉过详情补充（openJavdbWork），这里不重复
+  /// 拉。代次守卫：换片后旧结果不再写回；写回前再查一次剧
+  /// 照仍为空（期间页面自带剧照若已补上就不覆盖）。
+  Future<void> _loadJavdbStills(Drama drama, int generation) async {
+    if (drama.source == 'javdb') return;
+    final detail = _detail;
+    if (detail == null || detail.stills.isNotEmpty) return;
+    final avId = extractAvId(
+      title: drama.title,
+      id: drama.id,
+      sourceId: drama.sourceId,
+    );
+    if (avId == null) return;
+    final stills = await actressJavdbStillsSupplement(
+      current: detail.stills,
+      code: avId,
+      client: _javdbStillsClient,
+    );
+    if (!mounted || generation != _generation) return;
+    final current = _detail;
+    if (current == null || current.stills.isNotEmpty || stills.isEmpty) {
+      return;
+    }
+    setState(() {
+      _detail = current.withStills(stills);
+    });
+  }
+
+  /// JavDB 补充第二路（2026-11-26）：磁力区 + 评论区 + 信息卡
+  /// 的系列/评分，与 _loadJavdbStills 同一处后台补充链。按番
+  /// 号精确命中 JavDB 作品后并行取三路（磁力、评论、详情），
+  /// 每路独立约 6 秒超时、独立失败回空：没数据整区不显示、
+  /// 不挡开页、不弹窗。JavDB 入口的作品 sourceId 就是 JavDB
+  /// 作品 id，直接用、不再搜索。系列/评分只在详情自带
+  /// extraInfo 没有同名行时才并入（本地库自带真值照旧优先），
+  /// 评分照接口原值、人数照接口原值，都没给就不显示、不编。
+  Future<void> _loadJavdbExtras(Drama drama, int generation) async {
+    final avId = extractAvId(
+      title: drama.title,
+      id: drama.id,
+      sourceId: drama.sourceId,
+    );
+    if (avId == null) return;
+    final client = _javdbStillsClient;
+    var movieId = '';
+    if (drama.source == 'javdb' && drama.sourceId.isNotEmpty) {
+      movieId = drama.sourceId;
+    } else {
+      try {
+        final hits = await client
+            .searchMovies(avId)
+            .timeout(const Duration(seconds: 6));
+        final wanted = actressCodeKey(avId);
+        for (final hit in hits) {
+          if (hit.id.isNotEmpty && actressCodeKey(hit.number) == wanted) {
+            movieId = hit.id;
+            break;
+          }
+        }
+      } catch (_) {
+        return;
+      }
+    }
+    if (movieId.isEmpty) return;
+    final magnetsFuture = () async {
+      try {
+        return await client
+            .movieMagnets(movieId)
+            .timeout(const Duration(seconds: 6));
+      } catch (_) {
+        return const <MagnetLink>[];
+      }
+    }();
+    final reviewsFuture = () async {
+      try {
+        return await client
+            .movieReviews(movieId)
+            .timeout(const Duration(seconds: 6));
+      } catch (_) {
+        return const <JavdbReview>[];
+      }
+    }();
+    final extraFuture = () async {
+      try {
+        return await client
+            .movieExtra(movieId)
+            .timeout(const Duration(seconds: 6));
+      } catch (_) {
+        return const JavdbMovieExtra();
+      }
+    }();
+    final magnets = await magnetsFuture;
+    final reviews = await reviewsFuture;
+    final extra = await extraFuture;
+    if (!mounted || generation != _generation) return;
+    setState(() {
+      if (magnets.isNotEmpty) _javdbMagnets = magnets;
+      if (reviews.isNotEmpty) _javdbReviews = reviews;
+      final detail = _detail;
+      if (detail != null) {
+        var series = '';
+        for (final row in extra.extraInfo) {
+          if (row.$1 == '系列') series = row.$2;
+        }
+        final additions = <(String, String)>[
+          if (series.isNotEmpty &&
+              !detail.extraInfo.any((row) => row.$1 == '系列'))
+            ('系列', series),
+          if (extra.score.isNotEmpty &&
+              !detail.extraInfo.any((row) => row.$1 == '评分'))
+            (
+              '评分',
+              extra.scoreCount > 0
+                  ? '${extra.score}（共 ${extra.scoreCount} 人评分）'
+                  : extra.score,
+            ),
+        ];
+        if (additions.isNotEmpty) {
+          _detail = detail.withExtraInfo([
+            ...detail.extraInfo,
+            ...additions,
+          ]);
+        }
+      }
+    });
+    // 磁力到齐后 115 自动离线才有提交对象（_startPan115 已
+    // 确认网盘无文件/无在跑任务时才真提交，去重在方法内）。
+    unawaited(_maybeSubmitPan115(avId, generation));
+  }
+
+  /// 115 区启动（2026-11-26）：与 JavDB 补充同一处后台链。
+  /// 未登录只出一行提示、不提交不报错；网盘已存该番号文件
+  /// 直接出播放行；有同番号/同 hash 的离线任务在跑就显示
+  /// 进度并轮询，下完转播放行；都没有时置 _pan115Checked，
+  /// 等磁力到齐由 _maybeSubmitPan115 自动提交一次。没磁力
+  /// 也没文件时整区不显示。全程不挡页、不弹窗、不跳网盘页。
+  Future<void> _startPan115(Drama drama, int generation) async {
+    final gateway = widget.pan115Gateway;
+    if (gateway == null || _pan115Started) return;
+    final avId = extractAvId(
+      title: drama.title,
+      id: drama.id,
+      sourceId: drama.sourceId,
+    );
+    if (avId == null) return;
+    _pan115Started = true;
+    try {
+      if (!await gateway.isLoggedIn()) {
+        if (!mounted || generation != _generation) return;
+        setState(() => _pan115LoginHint = true);
+        return;
+      }
+      final file = await gateway
+          .findFileByCode(avId)
+          .timeout(const Duration(seconds: 20), onTimeout: () => null);
+      if (!mounted || generation != _generation) return;
+      if (file != null) {
+        setState(() => _pan115File = file);
+        return;
+      }
+      final task = await _pan115TaskFor(gateway, avId);
+      if (!mounted || generation != _generation) return;
+      if (task != null && !task.done) {
+        setState(() {
+          _pan115Submitted = true;
+          _pan115Percent = task.percent;
+        });
+        _startPan115Polling(avId, generation);
+        return;
+      }
+      _pan115Checked = true;
+      await _maybeSubmitPan115(avId, generation);
+    } catch (_) {
+      // 115 链任何失败都只让本区不显示，不挡详情页。
+    }
+  }
+
+  /// 在离线任务里找这部作品的任务：磁力 hash 命中或任务名
+  /// 含番号（归一化）任一成立。找不到回 null。
+  Future<Pan115OfflineTask?> _pan115TaskFor(
+    Pan115Gateway gateway,
+    String avId,
+  ) async {
+    final tasks = await gateway
+        .listOfflineTasks()
+        .timeout(
+          const Duration(seconds: 15),
+          onTimeout: () => const <Pan115OfflineTask>[],
+        );
+    final key = pan115CodeKeyOf(avId);
+    final hashes = {
+      for (final magnet in _javdbMagnets) pan115InfoHashOf(magnet.url),
+    }..remove('');
+    for (final task in tasks) {
+      if (task.infoHash.isNotEmpty && hashes.contains(task.infoHash)) {
+        return task;
+      }
+      if (key.isNotEmpty && pan115CodeKeyOf(task.name).contains(key)) {
+        return task;
+      }
+    }
+    return null;
+  }
+
+  /// 自动离线提交（用户「磁力自动离线 115」口径）：只在
+  /// _startPan115 确认过「已登录、网盘无此文件、无在跑任务」
+  /// 后、且本页已有 JavDB 磁力时提交排名第一条（movieMagnets
+  /// 已照 jar 版 rankMagnets 排序去重，第一条即第一名）。
+  /// 去重三道：
+  /// ①本地已提交记录里有同 hash 不再提交（转入进度跟随）；
+  /// ②提交前再查任务列表，同 hash 在列不提交；③网盘已有
+  /// 文件不提交（_startPan115 已查、提交前再兜一次）。
+  /// 提交成功记本地记录、页面明示「已提交 115 离线」并
+  /// 轮询进度；失败整区回落不显示，不报错不弹窗。
+  Future<void> _maybeSubmitPan115(String avId, int generation) async {
+    final gateway = widget.pan115Gateway;
+    if (gateway == null || !_pan115Checked) return;
+    if (_pan115File != null || _pan115Submitted) return;
+    if (_javdbMagnets.isEmpty) return;
+    try {
+      final magnet = _javdbMagnets.first;
+      final hash = pan115InfoHashOf(magnet.url);
+      if (await gateway.findFileByCode(avId) != null) return;
+      final submitted = await gateway.submittedHashes();
+      if (hash.isNotEmpty && submitted.contains(hash)) {
+        await _followPan115Task(gateway, avId, generation);
+        return;
+      }
+      final existing = await _pan115TaskFor(gateway, avId);
+      if (existing != null) {
+        if (!existing.done) {
+          await _followPan115Task(gateway, avId, generation);
+        }
+        return;
+      }
+      final ok = await gateway
+          .submitOffline(magnet.url)
+          .timeout(const Duration(seconds: 15), onTimeout: () => false);
+      if (!ok) return;
+      await gateway.recordSubmitted(hash);
+      if (!mounted || generation != _generation) return;
+      setState(() {
+        _pan115Submitted = true;
+        _pan115Percent = null;
+      });
+      _startPan115Polling(avId, generation);
+    } catch (_) {
+      // 提交失败不提示、不挡页（磁力区仍可手动复制）。
+    }
+  }
+
+  /// 转入进度跟随：显示已提交与当前进度并开始轮询。
+  Future<void> _followPan115Task(
+    Pan115Gateway gateway,
+    String avId,
+    int generation,
+  ) async {
+    final task = await _pan115TaskFor(gateway, avId);
+    if (!mounted || generation != _generation) return;
+    setState(() {
+      _pan115Submitted = true;
+      _pan115Percent = task?.percent;
+    });
+    _startPan115Polling(avId, generation);
+  }
+
+  void _startPan115Polling(String avId, int generation) {
+    _pan115Timer?.cancel();
+    _pan115Timer = Timer.periodic(const Duration(seconds: 10), (_) {
+      unawaited(_pollPan115(avId, generation));
+    });
+  }
+
+  /// 轮询：文件出现（下载完成）即转播放行并停轮询；还在
+  /// 跑就刷新进度。失败下轮再来，不提示。
+  Future<void> _pollPan115(String avId, int generation) async {
+    final gateway = widget.pan115Gateway;
+    if (gateway == null) return;
+    try {
+      final file = await gateway
+          .findFileByCode(avId)
+          .timeout(const Duration(seconds: 20), onTimeout: () => null);
+      if (!mounted || generation != _generation) return;
+      if (file != null) {
+        _pan115Timer?.cancel();
+        setState(() {
+          _pan115File = file;
+          _pan115Submitted = false;
+          _pan115Percent = null;
+        });
+        return;
+      }
+      final task = await _pan115TaskFor(gateway, avId);
+      if (!mounted || generation != _generation) return;
+      if (task != null) {
+        setState(() => _pan115Percent = task.percent);
+      }
+    } catch (_) {
+      // 轮询失败不提示。
+    }
+  }
+
+  /// 115 播放：取直链后在本页直达正式播放器（与在线线路
+  /// 同一条 pushPlayer 路径），不跳网盘页找文件（2026-11-26
+  /// 用户令）。
+  Future<void> _playPan115Line() async {
+    final gateway = widget.pan115Gateway;
+    final file = _pan115File;
+    if (gateway == null || file == null) return;
+    final link = await gateway.directLink(file);
+    if (link == null || !mounted) return;
+    final drama = widget.drama;
+    final detail = DramaDetail(
+      Drama(
+        id: 'pan115:${file.id}',
+        source: 'pan115',
+        sourceId: file.id,
+        title: drama.title,
+        cover: drama.cover,
+        tags: drama.tags,
+      ),
+      [
+        Episode({
+          'id': link.url,
+          'title': '正片',
+          'direct': true,
+          'headers': link.headers,
+        }, 1),
+      ],
+    );
+    await _playActressOnlineLine(detail);
+  }
+
+  /// 海报点按（2026-11-26 直达口径）：115 已存该番号文件
+  /// 时优先落 115 线路（20:10 起播口径：115 正常优先），
+  /// 否则播当前详情线路（竞速赢家/库线路已在详情里），都
+  /// 在本页直达播放器、不跳别页；115 还在下载中时照 jar
+  /// 版 waitPlayable 等不完的口径给百分比提示，不硬播、
+  /// 过会儿再点即秒开。
+  void _playFromPoster(int resumeIndex) {
+    final episodes = _detail?.episodes ?? const <Episode>[];
+    if (_pan115File != null) {
+      unawaited(_playPan115Line());
+    } else if (episodes.isNotEmpty) {
+      _play(resumeIndex, resume: true);
+    } else if (_pan115Submitted) {
+      _showPan115WaitHint();
+    }
+  }
+
+  /// 115 下载中点按提示（照 jar 版等不完的回话）：带当前
+  /// 百分比，明示过 1~2 分钟再点就是秒开。
+  void _showPan115WaitHint() {
+    final percent = _pan115Percent;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          percent == null
+              ? '正在存到 115，过 1~2 分钟再点一次就是秒开'
+              : '正在存到 115（已 ${(percent * 100).round()}%），'
+                    '过 1~2 分钟再点一次就是秒开',
+        ),
+      ),
+    );
   }
 
   Future<void> _loadTmdb(Drama drama) async {
@@ -510,6 +931,9 @@ class _DetailScreenState extends State<DetailScreen> {
       unawaited(_loadRecommended(merged, generation));
       unawaited(_loadSeriesApi(merged, generation));
       unawaited(_refreshCodeMeta(merged, generation));
+      unawaited(_loadJavdbStills(merged, generation));
+      unawaited(_loadJavdbExtras(merged, generation));
+      unawaited(_startPan115(merged, generation));
       if (_isFolderDrama(merged)) {
         unawaited(_loadFolder(reset: true));
       }
@@ -540,6 +964,34 @@ class _DetailScreenState extends State<DetailScreen> {
       }
     } catch (error) {
       if (!mounted || generation != _generation) {
+        return;
+      }
+      // 2026-11-26：带了候选详情（initialDetail）且仓库详情抛
+      // 错时落候选——演员库在线源（123AV/PH）没在仓库注册，
+      // detail 必然抛错，但点卡时已经把详情与直链集备齐了，
+      // 不该因为查不到站点就整页报错。集数回退口径与上面
+      // “取回为空”分支一致；代码元数据照常后台补（演员行/
+      // 信息卡靠它），其余补充链跳过（都要走仓库）。
+      // JavDB 源例外：它是信息源、点开时本来就没有集数（线
+      // 路靠跨站探活与在线线路区按番号自动搜），集数为空也
+      // 落候选进页，不整页报错。
+      final initial = widget.initialDetail;
+      if (initial != null &&
+          (initial.episodes.isNotEmpty || widget.drama.source == 'javdb')) {
+        setState(() {
+          _detail = initial.withDrama(widget.drama);
+          _loading = false;
+          _episodePage =
+              resumeEpisodeIndex(
+                initial.episodes,
+                widget.store.watched(widget.drama.id),
+              ) ~/
+              episodePageSize;
+        });
+        unawaited(_refreshCodeMeta(widget.drama, generation));
+        unawaited(_loadJavdbStills(widget.drama, generation));
+        unawaited(_loadJavdbExtras(widget.drama, generation));
+        unawaited(_startPan115(widget.drama, generation));
         return;
       }
       setState(() {
@@ -787,6 +1239,44 @@ class _DetailScreenState extends State<DetailScreen> {
     );
   }
 
+  /// 在线线路区（2026-11-26 用户令）：带番号的片自动按番号
+  /// 去 123AV / PH 搜线路、追加成可点行；与跨站区（who's
+  /// py 链等注册站）并行，互不阻塞。无番号不显示。
+  Widget _actressOnlineLinesSection(Drama drama) {
+    final avId = extractAvId(
+      title: drama.title,
+      id: drama.id,
+      sourceId: drama.sourceId,
+    );
+    if (avId == null) return const SizedBox.shrink();
+    return ActressOnlineLinesSection(
+      key: ValueKey('actress-lines-$avId-${drama.source}-${drama.id}'),
+      code: avId,
+      onPlay: (detail) => unawaited(_playActressOnlineLine(detail)),
+      sources: kActressLineSources,
+      repository: widget.repository,
+    );
+  }
+
+  /// 在线线路起播：解析/嗅探只负责取链，地址连请求头递给
+  /// 正式播放器（pushPlayer），不在网页里播（2026-11-26
+  /// 16:59 令）。这两源未在站点表注册，allowsSource 门不适
+  /// 用，走与在线视图点卡相同的直递播放器路径。
+  Future<void> _playActressOnlineLine(DramaDetail detail) async {
+    _frameService.cancel();
+    await pushPlayer<void>(
+      context,
+      detail: detail,
+      initialIndex: 0,
+      repository: widget.repository,
+      store: widget.store,
+      queue: widget.queue,
+    );
+    if (mounted) {
+      setState(() {});
+    }
+  }
+
   void _closeEmbedded() {
     if (_embeddedIndex == null) return;
     setState(() {
@@ -894,6 +1384,7 @@ class _DetailScreenState extends State<DetailScreen> {
           drama: drama,
           repository: widget.repository,
           store: widget.store,
+          pan115Gateway: widget.pan115Gateway,
         ),
       ),
     );
@@ -913,6 +1404,7 @@ class _DetailScreenState extends State<DetailScreen> {
           drama: peer.withPeers(peers),
           repository: widget.repository,
           store: widget.store,
+          pan115Gateway: widget.pan115Gateway,
         ),
       ),
     );
@@ -1058,12 +1550,18 @@ class _DetailScreenState extends State<DetailScreen> {
                                 crossAxisAlignment: CrossAxisAlignment.start,
                                 children: [
                                   _overview(drama),
+                                  _infoCard(drama),
+                                  _stillsSection(drama),
                                   _descriptionSection(drama),
                                   _magnetSection(),
                                   _crossSiteSection(drama),
+                                  _actressOnlineLinesSection(drama),
+                                  _javdbMagnetSection(),
+                                  _pan115Section(),
                                   _tmdbEpisodeSection(),
                                   _seriesSection(drama),
                                   _relatedSection(drama),
+                                  _javdbReviewsSection(),
                                 ],
                               ),
                             ),
@@ -1182,7 +1680,15 @@ class _DetailScreenState extends State<DetailScreen> {
                                     // 海报点按只认“有可播的集”：重载/刷新中的
                                     // 瞬时加载态不许卡死海报播放入口（与已删
                                     // 底部钮的行为一致，_play 自带空详情守卫）。
-                                    ready: allowed && episodes.isNotEmpty,
+                                    // 演员库作品一部集数都没有但 115 已存该
+                                    // 番号文件时也放行，点按落 115 线路直达
+                                    // 播放器；115 下载中也放行，点按给百分
+                                    // 比提示（_playFromPoster）。
+                                    ready:
+                                        allowed &&
+                                        (episodes.isNotEmpty ||
+                                            _pan115File != null ||
+                                            _pan115Submitted),
                                     resumeIndex: resumeIndex,
                                   ),
                                 ),
@@ -1196,6 +1702,10 @@ class _DetailScreenState extends State<DetailScreen> {
                                   ),
                                   child: _overview(drama),
                                 ),
+                              ),
+                              SliverToBoxAdapter(child: _infoCard(drama)),
+                              SliverToBoxAdapter(
+                                child: _stillsSection(drama),
                               ),
                               if (_loading ||
                                   _error != null ||
@@ -1257,12 +1767,24 @@ class _DetailScreenState extends State<DetailScreen> {
                                   SliverToBoxAdapter(
                                     child: _crossSiteSection(drama),
                                   ),
+                                SliverToBoxAdapter(
+                                  child: _actressOnlineLinesSection(drama),
+                                ),
+                                  SliverToBoxAdapter(
+                                    child: _javdbMagnetSection(),
+                                  ),
+                                  SliverToBoxAdapter(
+                                    child: _pan115Section(),
+                                  ),
                                   SliverToBoxAdapter(
                                     child: _descriptionSection(drama),
                                   ),
                                   SliverToBoxAdapter(child: _magnetSection()),
                                   SliverToBoxAdapter(
                                     child: _relatedSection(drama),
+                                  ),
+                                  SliverToBoxAdapter(
+                                    child: _javdbReviewsSection(),
                                   ),
                                 ],
                               ] else ...[
@@ -1368,12 +1890,24 @@ class _DetailScreenState extends State<DetailScreen> {
                                 SliverToBoxAdapter(
                                   child: _crossSiteSection(drama),
                                 ),
+                              SliverToBoxAdapter(
+                                child: _actressOnlineLinesSection(drama),
+                              ),
+                                SliverToBoxAdapter(
+                                  child: _javdbMagnetSection(),
+                                ),
+                                SliverToBoxAdapter(
+                                  child: _pan115Section(),
+                                ),
                                 SliverToBoxAdapter(
                                   child: _descriptionSection(drama),
                                 ),
                                 SliverToBoxAdapter(child: _magnetSection()),
                                 SliverToBoxAdapter(
                                   child: _relatedSection(drama),
+                                ),
+                                SliverToBoxAdapter(
+                                  child: _javdbReviewsSection(),
                                 ),
                               ],
                             ],
@@ -1420,7 +1954,7 @@ class _DetailScreenState extends State<DetailScreen> {
           color: Colors.transparent,
           child: InkWell(
             key: const ValueKey('detail-poster-play'),
-            onTap: ready ? () => _play(resumeIndex, resume: true) : null,
+            onTap: ready ? () => _playFromPoster(resumeIndex) : null,
           ),
         ),
       );
@@ -1660,6 +2194,248 @@ class _DetailScreenState extends State<DetailScreen> {
               ).showSnackBar(const SnackBar(content: Text('磁力链接暂不支持播放'))),
             ),
         ],
+      ),
+    );
+  }
+
+  /// JavDB 磁力区（放在在线线路区下面）：名称 + 大小/日期
+  /// 副标照 _magnetSection 的样子，点按=复制磁力链接到剪贴
+  /// 板并给中文提示。只给链接：不做站内播放、不做下载器、
+  /// 不接第三方网盘。数据为空整区不显示（_loadJavdbExtras
+  /// 填 _javdbMagnets）。不并入通用 _magnetSection：它的点
+  /// 按口径是「暂不支持播放」提示，与本链复制口径不合，
+  /// 改它会动通用详情页既有行为。
+  Widget _javdbMagnetSection() {
+    if (_javdbMagnets.isEmpty) return const SizedBox.shrink();
+    final colors = Theme.of(context).colorScheme;
+    return Padding(
+      key: const ValueKey('javdb-magnets-section'),
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('磁力链接', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Text(
+            '来源：JavDB · 点按复制磁力链接',
+            style: TextStyle(color: colors.onSurfaceVariant, fontSize: 12),
+          ),
+          const SizedBox(height: 8),
+          for (final magnet in _javdbMagnets)
+            ListTile(
+              key: ValueKey('javdb-magnet-${magnet.url}'),
+              contentPadding: EdgeInsets.zero,
+              title: Text(magnet.name.isEmpty ? '磁力链接' : magnet.name),
+              subtitle: magnet.metaLabel.isEmpty
+                  ? null
+                  : Text(magnet.metaLabel),
+              trailing: const Icon(Icons.copy_outlined, size: 18),
+              onTap: () => unawaited(_copyMagnet(magnet.url)),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 115 区（在线线路区附近，磁力区下面）：未登录只出一行
+  /// 提示；网盘已存该番号文件出「115 播放」行，点按在本页
+  /// 直达正式播放器（_playPan115Line，不跳网盘页）；已自动
+  /// 离线未下完显示「已提交 115 离线」与进度，下完自动转
+  /// 播放行。没存也没磁力时整区不显示（_startPan115 维护）。
+  Widget _pan115Section() {
+    final colors = Theme.of(context).colorScheme;
+    if (_pan115LoginHint) {
+      return Padding(
+        key: const ValueKey('actress-pan115-section'),
+        padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
+        child: Row(
+          children: [
+            Icon(
+              Icons.cloud_off_outlined,
+              size: 18,
+              color: colors.onSurfaceVariant,
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Text(
+                // 轻提示口径（2026-11-26 用户令）：115 不是播放
+                // 前置条件，未登录只留这一行、不弹窗不挡播放；
+                // 登录入口指向 App 现行网盘页登录，演员库不另
+                // 建登录界面。
+                '115 未登录，登录后可自动离线并在本页播放（去网盘页登录）；未登录不影响在线与本地线路播放',
+                style: TextStyle(color: colors.onSurfaceVariant, fontSize: 12.5),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    final file = _pan115File;
+    if (file == null && !_pan115Submitted) {
+      return const SizedBox.shrink();
+    }
+    return Padding(
+      key: const ValueKey('actress-pan115-section'),
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('115', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 8),
+          if (file != null)
+            ListTile(
+              key: const ValueKey('actress-pan115-play'),
+              contentPadding: EdgeInsets.zero,
+              leading: const Icon(Icons.play_circle_outline_rounded),
+              title: Text(
+                file.name,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              subtitle: const Text('115 网盘 · 点按播放'),
+              onTap: () => unawaited(_playPan115Line()),
+            )
+          else ...[
+            InkWell(
+              onTap: _showPan115WaitHint,
+              child: Row(
+                children: [
+                  Icon(
+                    Icons.cloud_download_outlined,
+                    size: 18,
+                    color: colors.onSurfaceVariant,
+                  ),
+                  const SizedBox(width: 8),
+                  Text(
+                    _pan115Percent == null
+                        ? '已提交 115 离线，正在下载…'
+                        : '已提交 115 离线，下载中 ${(_pan115Percent! * 100).round()}%',
+                    style: const TextStyle(fontSize: 13.5),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(value: _pan115Percent),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Future<void> _copyMagnet(String url) async {
+    await Clipboard.setData(ClipboardData(text: url));
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('磁力链接已复制')));
+  }
+
+  /// JavDB 评论区（作品详情页最下方，只读）：头像走
+  /// _detailStillImage（图床地址过 XOR 解密、其余直显），
+  /// 没头像用昵称首字占位。数据为空整区不显示；不做发表/
+  /// 点赞交互（点赞数只展示）。
+  Widget _javdbReviewsSection() {
+    if (_javdbReviews.isEmpty) return const SizedBox.shrink();
+    final colors = Theme.of(context).colorScheme;
+    return Padding(
+      key: const ValueKey('javdb-reviews-section'),
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 24),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('评论', style: Theme.of(context).textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Text(
+            '来源：JavDB',
+            style: TextStyle(color: colors.onSurfaceVariant, fontSize: 12),
+          ),
+          const SizedBox(height: 12),
+          for (final review in _javdbReviews) ...[
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _reviewAvatar(review),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              review.username.isEmpty ? '匿名' : review.username,
+                              style: const TextStyle(
+                                fontSize: 13.5,
+                                fontWeight: FontWeight.w600,
+                              ),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          if (review.createdAt.isNotEmpty)
+                            Text(
+                              review.createdAt.length > 10
+                                  ? review.createdAt.substring(0, 10)
+                                  : review.createdAt,
+                              style: TextStyle(
+                                color: colors.onSurfaceVariant,
+                                fontSize: 12,
+                              ),
+                            ),
+                        ],
+                      ),
+                      const SizedBox(height: 2),
+                      Text(review.content, style: const TextStyle(fontSize: 13.5)),
+                      if (review.likes > 0) ...[
+                        const SizedBox(height: 4),
+                        Row(
+                          children: [
+                            Icon(
+                              Icons.thumb_up_outlined,
+                              size: 13,
+                              color: colors.onSurfaceVariant,
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              '${review.likes}',
+                              style: TextStyle(
+                                color: colors.onSurfaceVariant,
+                                fontSize: 12,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _reviewAvatar(JavdbReview review) {
+    if (review.avatarUrl.isNotEmpty) {
+      return ClipOval(
+        child: SizedBox(
+          width: 36,
+          height: 36,
+          child: _detailStillImage(review.avatarUrl),
+        ),
+      );
+    }
+    return CircleAvatar(
+      radius: 18,
+      child: Text(
+        review.username.isEmpty
+            ? '?'
+            : String.fromCharCode(review.username.runes.first),
       ),
     );
   }
@@ -1978,6 +2754,7 @@ class _DetailScreenState extends State<DetailScreen> {
           drama: target,
           repository: widget.repository,
           store: widget.store,
+          pan115Gateway: widget.pan115Gateway,
           onTagTap: widget.onTagTap,
           queue: PlaybackQueue.around(related, target),
           autoPlayOnOpen: wasPlaying,
@@ -2154,33 +2931,288 @@ class _DetailScreenState extends State<DetailScreen> {
     return meta.cast.isNotEmpty || meta.director.isNotEmpty;
   }
 
-  /// 演员小头像 + 名字横排（2026-11-24 用户令：显示在“成人影片”
-  /// 下面这一行）。点头像名字走标签搜索（与原来文字标签同一入口）。
+  /// 演员区（2026-11-26 照 AvPlay 详情页截图改卡片排）：标题
+  /// 「演员」+ 横排照片卡（照片 + 底部白条名字），男女演员都
+  /// 列（数据来自番号元数据 castWithAvatars，含男优）；导演
+  /// 放标题行右侧小字。点卡走与原文字标签同一入口
+  /// （_onTagPressed）。原形态是 ActionChip 小头像行
+  /// （2026-11-24），本版按截图换卡片，键与点按行为不变。
   Widget _castChipsRow(Drama drama) {
     final meta = _codeMeta!;
     final cast = meta.castWithAvatars;
+    final colors = Theme.of(context).colorScheme;
     return Padding(
-      padding: const EdgeInsets.only(top: 10),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 8,
+      padding: const EdgeInsets.only(top: 14),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          for (final actor in cast)
-            ActionChip(
-              key: ValueKey('cast-${actor.name}'),
-              avatar: ActressAvatar(
-                avatarUrl: actor.avatarUrl,
-                name: actor.name,
-                radius: 12,
+          Row(
+            children: [
+              const Text(
+                '演员',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
               ),
-              label: Text(actor.name),
-              onPressed: () => _onTagPressed(
-                drama,
-                DetailTag(id: actor.name, name: actor.name),
+              const Spacer(),
+              if (meta.director.isNotEmpty)
+                Text(
+                  '导演：${meta.director}',
+                  style: TextStyle(
+                    color: colors.onSurfaceVariant,
+                    fontSize: 12,
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                for (final actor in cast) ...[
+                  _castCard(drama, actor),
+                  const SizedBox(width: 10),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 演员照片卡（规格表 UI_SPEC.md 已证实项：白卡、卡内
+  /// 4dp 内边距、照片 1:1 正方形、名字 13sp SemiBold）：
+  /// 照片下方白条名字，点卡走标签搜索入口。
+  Widget _castCard(Drama drama, ({String name, String avatarUrl}) actor) {
+    Widget placeholder() => ColoredBox(
+      color: const Color(0xFFF1F1F3),
+      child: Center(
+        child: Text(
+          actor.name.isEmpty ? '?' : actor.name.characters.first,
+          style: const TextStyle(
+            color: Color(0xFF8E8E93),
+            fontSize: 26,
+            fontWeight: FontWeight.w700,
+          ),
+        ),
+      ),
+    );
+    return InkWell(
+      key: ValueKey('cast-${actor.name}'),
+      onTap: () => _onTagPressed(
+        drama,
+        DetailTag(id: actor.name, name: actor.name),
+      ),
+      borderRadius: BorderRadius.circular(10),
+      child: Container(
+        width: 92,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(10),
+          color: Colors.white,
+        ),
+        clipBehavior: Clip.antiAlias,
+        padding: const EdgeInsets.all(4),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: SizedBox(
+                width: 84,
+                height: 84,
+                child: actor.avatarUrl.isEmpty
+                    ? placeholder()
+                    : Image.network(
+                        actor.avatarUrl,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, _, _) => placeholder(),
+                      ),
               ),
             ),
-          if (meta.director.isNotEmpty)
-            Chip(label: Text('导演：${meta.director}')),
+            const SizedBox(height: 4),
+            Text(
+              actor.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              textAlign: TextAlign.center,
+              style: const TextStyle(
+                color: Color(0xFF191919),
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 信息卡（2026-11-26 照 AvPlay 详情页截图）：圆角深色卡里
+  /// 逐行列 番号 / 发行日期 / 长度 / 制作商——只放真有的字段：
+  /// 番号来自番号元数据或番号形标签；日期优先详情自带的
+  /// extraInfo、其次 Drama.onlineDate；其余行全走 extraInfo
+  /// （在线源详情页自带字段、本地库厂牌）。系列与评分：详情
+  /// 自带 extraInfo 有真值照显；没有时由 JavDB 补充链按番号
+  /// 补（_loadJavdbExtras，评分照接口原值、人数照原值），
+  /// 两路都拿不到就不显示、不编（用户令），截图里的金色
+  /// 缎带评分徽标同理不挂。番号可点复制。没有番号也没有附
+  /// 加信息时整卡不显示（普通剧集不受影响）。
+  Widget _infoCard(Drama drama) {
+    final extra = _detail?.extraInfo ?? const <(String, String)>[];
+    String extraValue(String label) {
+      for (final row in extra) {
+        if (row.$1 == label) return row.$2;
+      }
+      return '';
+    }
+
+    var code = _codeMeta?.code ?? '';
+    if (code.isEmpty) {
+      for (final tag in drama.tags) {
+        final value = tag.trim();
+        if (RegExp(r'^[A-Za-z]{2,}-?[0-9]{2,}').hasMatch(value)) {
+          code = value;
+          break;
+        }
+      }
+    }
+    final rows = <(String, String, bool)>[
+      if (code.isNotEmpty) ('番号', code, true),
+      if (extraValue('发行日期').isNotEmpty)
+        ('发行日期', extraValue('发行日期'), false)
+      else if (drama.onlineDate.isNotEmpty)
+        ('发行日期', drama.onlineDate, false),
+      for (final row in extra)
+        if (row.$1 != '发行日期' && row.$2.isNotEmpty)
+          (row.$1, row.$2, false),
+    ];
+    if (rows.isEmpty) return const SizedBox.shrink();
+    final colors = Theme.of(context).colorScheme;
+    return Padding(
+      key: const ValueKey('detail-info-card'),
+      padding: const EdgeInsets.fromLTRB(20, 4, 20, 8),
+      child: Container(
+        decoration: BoxDecoration(
+          color: colors.surfaceContainerHigh,
+          borderRadius: BorderRadius.circular(14),
+        ),
+        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (final row in rows)
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 5),
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    SizedBox(
+                      width: 72,
+                      child: Text(
+                        '${row.$1}：',
+                        style: TextStyle(
+                          color: colors.onSurfaceVariant,
+                          fontSize: 13.5,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: row.$3
+                          ? InkWell(
+                              key: const ValueKey('detail-info-code'),
+                              onTap: () => unawaited(_copyCode(row.$2)),
+                              child: Text(
+                                row.$2,
+                                style: const TextStyle(
+                                  fontSize: 13.5,
+                                  decoration: TextDecoration.underline,
+                                ),
+                              ),
+                            )
+                          : Text(
+                              row.$2,
+                              style: const TextStyle(fontSize: 13.5),
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _copyCode(String code) async {
+    await Clipboard.setData(ClipboardData(text: code));
+    if (!mounted) return;
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(const SnackBar(content: Text('番号已复制')));
+  }
+
+  /// 剧照区（2026-11-26 照 AvPlay 详情页截图）：标题「剧照」+
+  /// 右侧「全部 N >」+ 横排横构图剧照可滑。数据认详情自带
+  /// 的 stills（在线源取页内剧照区、py 源取页内剧照）与
+  /// JavDB 按番号补的预览图（自带为空才补，见
+  /// _loadJavdbStills）；两路都拿不到时 stills 为空、整区
+  /// 不显示，不拿封面冒充、不编数量（用户令）。头区那条
+  /// stills 缩略条是换背景图用的，与本区并存、职能不同。
+  Widget _stillsSection(Drama drama) {
+    final seen = <String>{};
+    final stills = <String>[
+      for (final s in _detail?.stills ?? const <String>[])
+        if (s.isNotEmpty && s != drama.cover && seen.add(s)) s,
+    ];
+    if (stills.isEmpty) return const SizedBox.shrink();
+    return Padding(
+      key: const ValueKey('detail-stills-section'),
+      padding: const EdgeInsets.fromLTRB(20, 8, 20, 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('剧照', style: Theme.of(context).textTheme.titleMedium),
+              const Spacer(),
+              if (stills.length > 3)
+                InkWell(
+                  key: const ValueKey('detail-stills-all'),
+                  onTap: () => Navigator.of(context).push(
+                    appPageRoute<void>(
+                      settings: const RouteSettings(name: 'stills'),
+                      builder: (_) => _StillsAllPage(stills: stills),
+                    ),
+                  ),
+                  child: Text(
+                    '全部 ${stills.length} >',
+                    style: TextStyle(
+                      color: Theme.of(context).colorScheme.onSurfaceVariant,
+                      fontSize: 13,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          SizedBox(
+            height: 104,
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              itemCount: stills.length,
+              itemBuilder: (context, index) => Padding(
+                padding: const EdgeInsets.only(right: 10),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: AspectRatio(
+                    aspectRatio: 16 / 10,
+                    child: _detailStillImage(stills[index]),
+                  ),
+                ),
+              ),
+            ),
+          ),
         ],
       ),
     );
@@ -2303,16 +3335,29 @@ class _DetailScreenState extends State<DetailScreen> {
         if (visibleTags.isNotEmpty)
           Padding(
             padding: const EdgeInsets.only(top: 12),
-            child: Wrap(
-              spacing: 6,
-              runSpacing: 6,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                for (final tag in visibleTags.take(12))
-                  ActionChip(
-                    key: ValueKey('detail-tag-${tag.id}'),
-                    label: Text(tag.name),
-                    onPressed: () => _onTagPressed(drama, tag),
-                  ),
+                // 相关分类（2026-11-26 照 AvPlay 详情页 GenreSection
+                // 的标题文案与分区摆法）：标题 + 胶囊横排，点胶囊
+                // 进对应标签列表（原 _onTagPressed 行为不变）。
+                const Text(
+                  '相关分类',
+                  style: TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 8),
+                Wrap(
+                  spacing: 6,
+                  runSpacing: 6,
+                  children: [
+                    for (final tag in visibleTags.take(12))
+                      ActionChip(
+                        key: ValueKey('detail-tag-${tag.id}'),
+                        label: Text(tag.name),
+                        onPressed: () => _onTagPressed(drama, tag),
+                      ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -2381,6 +3426,50 @@ class _DetailScreenState extends State<DetailScreen> {
             ],
           ),
         ],
+      ),
+    );
+  }
+}
+
+/// 一张剧照的显示组件：JavDB 图床的图字节带 XOR 加密，走
+/// JavdbImage 的解密路径（与 JavDB 封面/头像同一条，见
+/// javdb_image.dart）；其余来源的剧照维持普通网络图（失败
+/// 给深色占位，与此前一致）。
+Widget _detailStillImage(String url) {
+  if (javdbIsImageUrl(url)) {
+    return JavdbImage(url: url, fit: BoxFit.cover);
+  }
+  return Image.network(
+    url,
+    fit: BoxFit.cover,
+    errorBuilder: (_, _, _) => const ColoredBox(color: Colors.black26),
+  );
+}
+
+/// 全部剧照页（详情页剧照区「全部 N >」的落点）：两列网格
+/// 列全这部作品的剧照。
+class _StillsAllPage extends StatelessWidget {
+  const _StillsAllPage({required this.stills});
+
+  final List<String> stills;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: Text('剧照（${stills.length}）')),
+      body: GridView.builder(
+        padding: const EdgeInsets.all(12),
+        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+          crossAxisCount: 2,
+          crossAxisSpacing: 10,
+          mainAxisSpacing: 10,
+          childAspectRatio: 16 / 10,
+        ),
+        itemCount: stills.length,
+        itemBuilder: (context, index) => ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: _detailStillImage(stills[index]),
+        ),
       ),
     );
   }

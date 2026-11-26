@@ -823,6 +823,7 @@ class DramaDetail {
     this.related = const [],
     this.tags = const [],
     this.magnets = const [],
+    this.extraInfo = const [],
   });
   final Drama drama;
   final List<Episode> episodes;
@@ -833,6 +834,12 @@ class DramaDetail {
   final List<DetailTag> tags;
   final List<MagnetLink> magnets;
 
+  /// 附加信息行（标签 → 值）：详情页信息卡的数据来源之一
+  /// （在线源详情页自带的发行日期/长度/制作商等，源里有才带，
+  /// 没有就是空——详情页不编造）。与 Drama 自带字段（onlineDate
+  /// 等）重复时详情页优先用这里的。
+  final List<(String, String)> extraInfo;
+
   DramaDetail withDrama(Drama value) => DramaDetail(
     value,
     episodes,
@@ -842,6 +849,7 @@ class DramaDetail {
     related: related,
     tags: tags,
     magnets: magnets,
+    extraInfo: extraInfo,
   );
 
   DramaDetail withEpisodes(List<Episode> value) => DramaDetail(
@@ -853,6 +861,31 @@ class DramaDetail {
     related: related,
     tags: tags,
     magnets: magnets,
+    extraInfo: extraInfo,
+  );
+
+  DramaDetail withStills(List<String> value) => DramaDetail(
+    drama,
+    episodes,
+    warning: warning,
+    backdrop: backdrop,
+    stills: value,
+    related: related,
+    tags: tags,
+    magnets: magnets,
+    extraInfo: extraInfo,
+  );
+
+  DramaDetail withExtraInfo(List<(String, String)> value) => DramaDetail(
+    drama,
+    episodes,
+    warning: warning,
+    backdrop: backdrop,
+    stills: stills,
+    related: related,
+    tags: tags,
+    magnets: magnets,
+    extraInfo: value,
   );
 
   factory DramaDetail.fromJson(Map<String, dynamic> json) {

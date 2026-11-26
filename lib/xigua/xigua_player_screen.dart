@@ -44,6 +44,7 @@ import 'package:moyi/playback_recovery.dart';
 import 'package:moyi/playback_preferences.dart';
 import 'package:moyi/nonvideo_content.dart';
 import 'package:moyi/playback_sniffer.dart';
+import 'package:moyi/playback_sniff_verify.dart';
 import 'package:moyi/xigua/player_controls.dart';
 import 'package:moyi/network_speed.dart';
 import 'package:moyi/xigua/player_interactions.dart';
@@ -216,6 +217,7 @@ class _PlayerScreenState extends State<XiguaPlayerScreen>
   }
   String _lastPageUrl = '';
   bool _sniffFallbackTried = false;
+  bool _sniffRungConsumed = false;
   bool _deepSniffer = true;
   late PlayerCore _core;
   CoreFallbackController? _coreFallback;
@@ -1121,6 +1123,29 @@ class _PlayerScreenState extends State<XiguaPlayerScreen>
           }
         });
       } catch (_) {}
+      // 梯子最后一级（核播失败侧）：恢复链与核间回退都耗尽、手里
+      // 还有网页地址时，自动落嗅探兜底，与主播放器同口径，不再让
+      // 用户自己去点错误屏上的嗅探按钮。本集内只落一次
+      // （_sniffRungConsumed），防嗅探递送的地址核播再失败时循环。
+      if (mounted &&
+          !_closed &&
+          ticket == _generation &&
+          !current.local &&
+          !_sniffRungConsumed &&
+          _deepSniffer) {
+        final sniffPage = _lastPageUrl.isNotEmpty
+            ? _lastPageUrl
+            : (looksLikeWebPage(current.url) ? current.url : '');
+        if (sniffPage.isNotEmpty) {
+          _sniffRungConsumed = true;
+          _sniffFallbackTried = true;
+          _lastPageUrl = sniffPage;
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (mounted && !_closed) _openSniffer(auto: true);
+          });
+          return;
+        }
+      }
       if (mounted && !_closed && ticket == _generation) {
         setState(() {
           _loading = false;
@@ -1475,6 +1500,7 @@ class _PlayerScreenState extends State<XiguaPlayerScreen>
     }
     _resumePosition = position;
     _showControlsOnPlaybackReady = showControlsOnReady;
+    final previousIndex = _index;
     setState(() {
       _index = index;
       _loading = true;
@@ -1488,6 +1514,9 @@ class _PlayerScreenState extends State<XiguaPlayerScreen>
         _ => '正在准备播放',
       };
     });
+    if (previousIndex != index) {
+      _sniffRungConsumed = false;
+    }
     PlaybackPlan? prepared;
     PlaybackPlan? retained;
     bool installed = false;
@@ -1723,6 +1752,7 @@ class _PlayerScreenState extends State<XiguaPlayerScreen>
             });
             if (needsSniffFallback) {
               _sniffFallbackTried = true;
+              _sniffRungConsumed = true;
               _lastPageUrl = fallbackPage;
               final parseFailed =
                   error is AppFailure && error.message.contains('解析接口');
@@ -1797,6 +1827,14 @@ class _PlayerScreenState extends State<XiguaPlayerScreen>
           headers: _plan?.headers ?? const {},
           autoPlay: auto,
           onMediaFound: (url) => Navigator.of(routeContext).pop(url),
+          validateCandidate: sniffCandidateValidator(
+            headers: _plan?.headers ?? const {},
+          ),
+          sniffTimeout: sniffFallbackTimeout,
+          onSniffTimeout: () {
+            final navigator = Navigator.of(routeContext);
+            if (navigator.canPop()) navigator.pop();
+          },
         ),
       ),
     );

@@ -6,7 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
-import 'actress/actress_html_entry.dart';
+import 'actress/actress_nvku_page.dart';
 import 'game_zone_page.dart';
 import 'app_layout.dart';
 import 'auto_refresh_gate.dart';
@@ -16,6 +16,8 @@ import 'site_icon.dart';
 import 'site_thumb_cache.dart';
 import 'home_zone.dart';
 import 'app_theme_config.dart';
+import 'app_update.dart';
+import 'app_update_prompt.dart';
 import 'content_tier_filter.dart';
 import 'neon/neon_ui.dart';
 import 'ui_style.dart';
@@ -1300,6 +1302,21 @@ class _HomeScreenState extends State<HomeScreen>
       _loading = false;
     }
     unawaited(ensureDramaUiStyleLoaded());
+    // 启动后查一次整包更新，有新版就弹提示框（一次启动最多弹一次，
+    // 用户点过“稍后再说”的版本不再弹，有更新的版本才再弹）。
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_maybePromptAppUpdate());
+    });
+  }
+
+  Future<void> _maybePromptAppUpdate() async {
+    final prompt = await AppUpdateChecker.pendingUpdatePrompt();
+    if (prompt == null || !mounted) return;
+    await showAppUpdatePrompt(
+      context,
+      current: prompt.current,
+      latest: prompt.latest,
+    );
   }
 
   @override
@@ -2968,7 +2985,10 @@ class _HomeScreenState extends State<HomeScreen>
           ),
         );
       case Win7WindowKind.miniApp:
-        return const MiniAppHomePage(key: ValueKey('win7-miniapp'));
+        return MiniAppHomePage(
+          key: const ValueKey('win7-miniapp'),
+          repository: widget.repository,
+        );
       case Win7WindowKind.multimedia:
         return MultimediaScreen(
           key: const ValueKey('win7-multimedia'),
@@ -2993,7 +3013,7 @@ class _HomeScreenState extends State<HomeScreen>
       case Win7WindowKind.actress:
         // 与片库顶栏女优库钮同一页、同一构造（见 _openActressLibrary），
         // 只加窗口 key；详情/排行页的跳转行为与现有入口一致（各自 push）。
-        return ActressHtmlEntryPage(
+        return ActressNvkuPage(
           key: const ValueKey('win7-actress'),
           repository: widget.repository,
           store: widget.store,
@@ -3681,7 +3701,7 @@ class _HomeScreenState extends State<HomeScreen>
     // 小程序：与短剧首页内层页签是同一个首页（抽屉里的小程序
     // 入口已移到这里），不依赖片库站源，同样放空态判断之前。
     if (_miniAppRequested) {
-      return const MiniAppHomePage();
+      return MiniAppHomePage(repository: widget.repository);
     }
     // 我的：与短剧首页内层页签是同一个共享页。
     if (_mineRequested) {
@@ -3697,7 +3717,7 @@ class _HomeScreenState extends State<HomeScreen>
     // 女优库：与短剧首页内层页签是同一个列表页；合并名册不依赖
     // 片库站源，同样放空态判断之前。
     if (_actressRequested) {
-      return ActressHtmlEntryPage(
+      return ActressNvkuPage(
         repository: widget.repository,
         store: widget.store,
         showTitle: false,

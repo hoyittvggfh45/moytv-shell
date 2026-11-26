@@ -5,10 +5,12 @@ import 'dart:io';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:moyi/jar_bridge.dart';
 import 'package:moyi/miniapp/mini_app_bridge.dart';
 import 'package:moyi/miniapp/mini_app_manifest.dart';
 import 'package:moyi/miniapp/mini_app_sources.dart';
 import 'package:moyi/models.dart';
+import 'package:moyi/zakatv_builtin.dart';
 
 class _FakeSourceProvider implements MiniAppSourceProvider {
   final List<String> calls = [];
@@ -244,16 +246,41 @@ void main() {
   });
 
   group('HostMiniAppSourceProvider', () {
-    // 2026-11-26 空壳片库定版：zakatv/missav30 的 jar 片库登记已
-    // 全部剥离（表里只剩 audioOnly 的飞卢听书），本组原先从登记表
-    // 取两个 jar 视频站作夹具的路已断。jar 形态 key 改用已剥离站
-    // 的常量（ZakaMjv011），jar 分发路径在本树不可达——原 jar 路
-    // 测试分别改走 py 路（归一化/并发/超时等共享逻辑）或改为
-    // 剥离断言（SITE_NOT_FOUND、jar 桥不被调用）。
-    const jarSiteId = 'jar:zakatv:ZakaMjv011';
-    const jarShortKey = 'ZakaMjv011';
+    late ZakatvBuiltinSite jarBuiltin;
+    late ZakatvBuiltinSite jarUnregistered;
+    late String jarSiteId;
+    const standaloneJarSiteId = 'jar:standalone_test:demo';
 
     setUp(() {
+      // 空壳口径（组装适配）：本树 zakatv/missav30 内置 jar 登记已剥离
+      // （只剩 audioOnly 的飞卢听书），没有登记表视频站可作夹具。
+      // jar 夹具改为合成常量：jarSiteId 经 jar 桥注册 spec + 注册表
+      // import/jar 条目进汇合段（与带站点版经内置段进清单的差别只在
+      // 清单来源段与短 key/未注册的报错码，逐处在各测试里注明）。
+      jarBuiltin = const ZakatvBuiltinSite(
+        'ZakaTestA',
+        '测试 jar 站',
+        'csp_TestA',
+        '',
+      );
+      jarUnregistered = const ZakatvBuiltinSite(
+        'ZakaTestB',
+        '测试 jar 未注册站',
+        'csp_TestB',
+        '',
+      );
+      jarSiteId = JarSiteSpec.siteIdFor(zakatvJarId, jarBuiltin.key);
+      JarBridge.register(
+        JarSiteSpec(
+          siteId: jarSiteId,
+          configId: zakatvJarId,
+          name: jarBuiltin.name,
+          className: jarBuiltin.className,
+          jarUrl: '',
+          jarMd5: zakatvJarMd5,
+          ext: jarBuiltin.ext,
+        ),
+      );
       SourceSite.importedSites['test_py_builtin'] = const SourceSite(
         'test_py_builtin',
         '测试 py 站',
@@ -278,32 +305,132 @@ void main() {
         importType: 'py',
       );
       SourceSite.importedPyFiles['test_py_import'] = 'test_py_import.py';
+      // ZakaTV jar 内置站经 JarImport 还会在注册表里留一条同 id 的
+      // import/jar 登记（运行时真实形态），清单里必须去重。
+      SourceSite.importedSites[jarSiteId] = SourceSite(
+        jarSiteId,
+        jarBuiltin.name,
+        'ZakaTV jar 内置 · test',
+        origin: SourceSite.originImport,
+        importType: 'jar',
+      );
+      SourceSite.importedSites['test_jsonlist_import'] = const SourceSite(
+        'test_jsonlist_import',
+        '导入 jsonlist 站',
+        'JSON 列表导入站',
+        origin: SourceSite.originImport,
+        importType: 'jsonlist',
+      );
+      SourceSite.importedPyFiles['test_jsonlist_import'] =
+          'test_jsonlist_import.py';
+      // 独立导入 jar 站：spec 进 jar 桥 + 注册表一条 import/jar。
+      JarBridge.register(
+        const JarSiteSpec(
+          siteId: standaloneJarSiteId,
+          configId: 'standalone_test',
+          name: '独立导入 jar 站',
+          className: 'csp_Demo',
+          jarUrl: '',
+          jarMd5: '',
+          ext: '',
+        ),
+      );
+      SourceSite.importedSites[standaloneJarSiteId] = const SourceSite(
+        standaloneJarSiteId,
+        '独立导入 jar 站',
+        'jar 导入 · csp_Demo',
+        origin: SourceSite.originImport,
+        importType: 'jar',
+      );
+      // JS 蜘蛛与 idj 插件站：取数链不在本提供者，不进汇合集。
+      SourceSite.importedSites['test_js_import'] = const SourceSite(
+        'test_js_import',
+        '导入 JS 站',
+        'JS 蜘蛛导入站',
+        origin: SourceSite.originImport,
+        importType: 'js',
+      );
+      SourceSite.importedSites['idj_testplug'] = const SourceSite(
+        'idj_testplug',
+        '测试插件站',
+        'idj 插件 · test',
+        origin: SourceSite.originImport,
+        importType: 'js',
+        importExt: 'com.idj.ext.testplug',
+      );
     });
 
     tearDown(() {
+      JarBridge.unregister(jarSiteId);
+      JarBridge.unregister(standaloneJarSiteId);
       SourceSite.importedSites.remove('test_py_builtin');
       SourceSite.importedSites.remove('test_py_config');
       SourceSite.importedSites.remove('test_py_import');
+      SourceSite.importedSites.remove(jarSiteId);
+      SourceSite.importedSites.remove('test_jsonlist_import');
+      SourceSite.importedSites.remove(standaloneJarSiteId);
+      SourceSite.importedSites.remove('test_js_import');
+      SourceSite.importedSites.remove('idj_testplug');
       SourceSite.importedPyFiles.remove('test_py_builtin');
       SourceSite.importedPyFiles.remove('test_py_config');
       SourceSite.importedPyFiles.remove('test_py_import');
+      SourceSite.importedPyFiles.remove('test_jsonlist_import');
     });
 
-    test('list reads the same builtin registries as the zone', () async {
-      // 2026-11-26 空壳片库口径（测试名保留原名便于对照）：两个 jar
-      // 登记表已无视频站，listSites 的 jar 条目为零；py 条目仍只认
-      // originBuiltin 的运行时登记（本组夹具 test_py_builtin）。
+    test('list keeps the builtin segment intact and appends merged sites',
+        () async {
       final provider = HostMiniAppSourceProvider();
       final sites = await provider.listSites();
       final jarEntries = sites.where((e) => e['type'] == 'jar').toList();
-      expect(jarEntries, isEmpty);
-      expect(sites.any((e) => e['key'] == 'go_tingshu'), isFalse);
+      // 空壳口径：内置 jar 段为空（登记已剥离、只剩 audioOnly 的
+      // 飞卢听书不进清单），两条 jar 条目都来自汇合段（jarSiteId 与
+      // 独立导入 jar），且都已注册到 jar 桥、可用。
+      expect(jarEntries.length, 2);
+      for (final entry in jarEntries) {
+        expect(entry['searchable'], isTrue);
+        expect(entry['name'], isA<String>());
+        expect(entry['available'], isTrue);
+      }
+      final registered = jarEntries.firstWhere(
+        (e) => e['key'] == jarSiteId,
+      );
+      expect(registered['available'], isTrue);
+      // JarImport 的同 id 重复登记被去重：全表 key 不重复，
+      // jarSiteId 只出现一次，且在独立导入 jar 之前。
+      final keys = [for (final e in sites) e['key']];
+      expect(keys.toSet().length, keys.length);
+      expect(keys.where((k) => k == jarSiteId).length, 1);
+      expect(
+        keys.indexOf(jarSiteId) < keys.indexOf(standaloneJarSiteId),
+        isTrue,
+      );
+      final mergedJar = jarEntries.firstWhere(
+        (e) => e['key'] == standaloneJarSiteId,
+      );
+      expect(mergedJar['name'], '独立导入 jar 站');
+      expect(mergedJar['available'], isTrue);
+
+      // py 段：内置在前，汇合段按注册表顺序跟上（配置/导入/jsonlist）。
       final pyEntries = sites.where((e) => e['type'] == 'py').toList();
-      expect(pyEntries.length, 1);
-      expect(pyEntries.first['key'], 'test_py_builtin');
+      expect(
+        [for (final e in pyEntries) e['key']],
+        [
+          'test_py_builtin',
+          'test_py_config',
+          'test_py_import',
+          'test_jsonlist_import',
+        ],
+      );
       expect(pyEntries.first['name'], '测试 py 站');
       expect(pyEntries.first['searchable'], isTrue);
       expect(pyEntries.first['available'], isTrue);
+      expect(
+        pyEntries.every((e) => e['available'] == true),
+        isTrue,
+      );
+      // JS 蜘蛛与 idj 插件站不进清单。
+      expect(keys.contains('test_js_import'), isFalse);
+      expect(keys.contains('idj_testplug'), isFalse);
     });
 
     test('unknown keys and missing params fail with contract codes',
@@ -329,10 +456,14 @@ void main() {
           ),
         ),
       );
-      // 已剥离的 jar 站：登记表里查不到，直接 SITE_NOT_FOUND
-      // （原口径下登记在表、未注册到桥时是 SITE_UNAVAILABLE）。
+      final unregisteredId = JarSiteSpec.siteIdFor(
+        zakatvJarId,
+        jarUnregistered.key,
+      );
+      // 空壳口径：该 key 不在任何登记里（带站点版靠内置登记命中后报
+      // SITE_UNAVAILABLE），本树直接报 SITE_NOT_FOUND。
       await expectLater(
-        provider.home(jarSiteId),
+        provider.home(unregisteredId),
         throwsA(
           isA<MiniAppSourceFailure>().having(
             (e) => e.code,
@@ -361,32 +492,137 @@ void main() {
           ),
         ),
       );
-      await expectLater(
-        provider.home('test_py_config'),
-        throwsA(
-          isA<MiniAppSourceFailure>().having(
-            (e) => e.code,
-            'code',
-            'SITE_NOT_FOUND',
+      // JS 蜘蛛与 idj 插件站不在本提供者的取数链上，仍报未找到。
+      for (final key in ['test_js_import', 'idj_testplug']) {
+        await expectLater(
+          provider.home(key),
+          throwsA(
+            isA<MiniAppSourceFailure>().having(
+              (e) => e.code,
+              'code',
+              'SITE_NOT_FOUND',
+            ),
           ),
-        ),
+        );
+      }
+    });
+
+    test('merged import and config sites resolve via the existing chains',
+        () async {
+      final pySeen = <String>[];
+      final jarSeen = <String>[];
+      final provider = HostMiniAppSourceProvider(
+        pyCall: (source, request) async {
+          pySeen.add('$source:${request['action']}');
+          switch (request['action']) {
+            case 'home':
+              return {
+                'list': [
+                  {'vod_id': 'm1', 'vod_name': '汇合片'},
+                ],
+              };
+            case 'resolve':
+              return {'playUrl': 'https://cdn.example.com/m.m3u8'};
+          }
+          return {};
+        },
+        jarCall: (spec, method, args) async {
+          jarSeen.add('${spec.siteId}:$method');
+          return {
+            'list': [
+              {'vod_id': 'j1', 'vod_name': '导入 jar 片'},
+            ],
+          };
+        },
       );
+
+      // 导入 py、配置 py、jsonlist 导入站都走 py 桥现成动作。
+      for (final key in [
+        'test_py_import',
+        'test_py_config',
+        'test_jsonlist_import',
+      ]) {
+        final home = await provider.home(key);
+        expect((home['list'] as List).length, 1, reason: key);
+      }
+      expect(pySeen, [
+        'test_py_import:home',
+        'test_py_config:home',
+        'test_jsonlist_import:home',
+      ]);
+      final play = await provider.play(
+        siteKey: 'test_py_import',
+        flag: '默认',
+        id: 'q1',
+      );
+      expect(play['url'], 'https://cdn.example.com/m.m3u8');
+
+      // 独立导入 jar 站按完整 siteId 走 jar 桥，spec 就是注册那条。
+      final jarHome = await provider.home(standaloneJarSiteId);
+      expect((jarHome['list'] as List).length, 1);
+      expect(jarSeen, ['$standaloneJarSiteId:homeContent']);
     });
 
     test('jar data calls use the host jar bridge methods', () async {
-      // 2026-11-26 空壳片库口径（测试名保留原名便于对照）：jar 片库
-      // 登记已剥离，jar 分发路径在本树不可达——完整 key 与短 key
-      // 都回 SITE_NOT_FOUND，且 jar 桥一次都不被调用。jar 方法名/
-      // 参数的原断言随带站点版发布线维护，不在本树。
       final seen = <String>[];
       final provider = HostMiniAppSourceProvider(
         jarCall: (spec, method, args) async {
-          seen.add(method);
+          seen.add('$method:${args['tid'] ?? args['key'] ?? ''}');
+          switch (method) {
+            case 'homeContent':
+              return {
+                'class': [
+                  {'type_id': '1', 'type_name': '电影'},
+                ],
+                'list': [
+                  {'vod_id': 'v1', 'vod_name': '片一'},
+                ],
+              };
+            case 'homeVideoContent':
+              return {'list': []};
+            case 'categoryContent':
+              return {
+                'list': [
+                  {'vod_id': 'v2', 'vod_name': '片二'},
+                ],
+                'page': 2,
+                'pagecount': 5,
+              };
+            case 'detailContent':
+              return {
+                'list': [
+                  {
+                    'vod_id': 'v2',
+                    'vod_play_from': '线路1',
+                    'vod_play_url': '第1集\$p1',
+                  },
+                ],
+              };
+            case 'playerContent':
+              return {
+                'url': 'https://cdn.example.com/v.m3u8',
+                'header': '{"Referer":"https://example.com/"}',
+                'parse': 1,
+              };
+            case 'searchContent':
+              return {
+                'list': [
+                  {'vod_id': 'v3', 'vod_name': '搜到的片'},
+                ],
+              };
+          }
           return {};
         },
       );
+
+      final home = await provider.home(jarSiteId);
+      expect(home['classes'], home['class']);
+      expect((home['list'] as List).length, 1);
+
+      // 短 key：带站点版靠内置登记认；空壳登记已剥离、无登记可认，
+      // 报 SITE_NOT_FOUND（完整 siteId 经 jar 桥 spec 可认，见上）。
       await expectLater(
-        provider.home(jarSiteId),
+        provider.home(jarBuiltin.key),
         throwsA(
           isA<MiniAppSourceFailure>().having(
             (e) => e.code,
@@ -395,17 +631,47 @@ void main() {
           ),
         ),
       );
-      await expectLater(
-        provider.home(jarShortKey),
-        throwsA(
-          isA<MiniAppSourceFailure>().having(
-            (e) => e.code,
-            'code',
-            'SITE_NOT_FOUND',
-          ),
-        ),
+
+      final category = await provider.category(
+        siteKey: jarSiteId,
+        tid: '1',
+        page: 2,
+        ext: {'area': '2'},
       );
-      expect(seen, isEmpty);
+      expect(category['page'], 2);
+      expect(category['pagecount'], 5);
+
+      // 空分类先走 homeVideoContent，空列表再回落到 homeContent。
+      final emptyCategory = await provider.category(
+        siteKey: jarSiteId,
+        tid: '',
+        page: 1,
+      );
+      expect((emptyCategory['list'] as List).length, 1);
+
+      final detail = await provider.detail(siteKey: jarSiteId, id: 'v2');
+      expect(detail['vod_id'], 'v2');
+      expect(detail['vod_play_from'], ['线路1']);
+      expect(detail['vod_play_url'], ['第1集\$p1']);
+
+      final play = await provider.play(
+        siteKey: jarSiteId,
+        flag: '线路1',
+        id: 'p1',
+      );
+      expect(play['url'], 'https://cdn.example.com/v.m3u8');
+      expect(play['header'], {'Referer': 'https://example.com/'});
+      expect(play['parse'], '1');
+      expect(play.containsKey('jx'), isFalse);
+
+      final search = await provider.search(
+        siteKey: jarSiteId,
+        wd: '关键词',
+        page: 1,
+      );
+      expect((search['list'] as List).length, 1);
+      expect(seen, contains('categoryContent:1'));
+      expect(seen, contains('searchContent:关键词'));
     });
 
     test('py data calls use the host py actions', () async {
@@ -495,22 +761,25 @@ void main() {
     });
 
     test('detail unwraps the vod and splits multi-line play fields', () async {
-      // 2026-11-26：原走 jar 路取数；详情拆包/分行逻辑两路共享，
-      // 空壳片库下改走 py 路验同一逻辑。
       final provider = HostMiniAppSourceProvider(
-        pyCall: (_, _) async => {
-          'list': [
-            {
-              'vod_id': 'v9',
-              'vod_name': '片九',
-              'vod_pic': 'https://example.com/p.jpg',
-              'vod_play_from': '线路1\$\$\$线路2',
-              'vod_play_url': '第1集\$a1#第2集\$a2\$\$\$正片\$b1',
-            },
-          ],
+        jarCall: (_, method, _) async {
+          if (method == 'detailContent') {
+            return {
+              'list': [
+                {
+                  'vod_id': 'v9',
+                  'vod_name': '片九',
+                  'vod_pic': 'https://example.com/p.jpg',
+                  'vod_play_from': '线路1\$\$\$线路2',
+                  'vod_play_url': '第1集\$a1#第2集\$a2\$\$\$正片\$b1',
+                },
+              ],
+            };
+          }
+          return {};
         },
       );
-      final detail = await provider.detail(siteKey: 'test_py_builtin', id: 'v9');
+      final detail = await provider.detail(siteKey: jarSiteId, id: 'v9');
       expect(detail['vod_id'], 'v9');
       expect(detail['vod_name'], '片九');
       expect(detail['vod_pic'], 'https://example.com/p.jpg');
@@ -521,9 +790,9 @@ void main() {
 
     test('detail with an empty list returns an empty map', () async {
       final provider = HostMiniAppSourceProvider(
-        pyCall: (_, _) async => {'list': []},
+        jarCall: (_, _, _) async => {'list': []},
       );
-      final detail = await provider.detail(siteKey: 'test_py_builtin', id: 'v0');
+      final detail = await provider.detail(siteKey: jarSiteId, id: 'v0');
       expect(detail, isEmpty);
     });
 
@@ -564,10 +833,10 @@ void main() {
 
     test('spider errors become SOURCE_FAILED', () async {
       final provider = HostMiniAppSourceProvider(
-        pyCall: (_, _) async => throw StateError('boom'),
+        jarCall: (_, _, _) async => throw StateError('boom'),
       );
       await expectLater(
-        provider.home('test_py_builtin'),
+        provider.home(jarSiteId),
         throwsA(
           isA<MiniAppSourceFailure>().having(
             (e) => e.code,
@@ -582,17 +851,17 @@ void main() {
       final gate = Completer<void>();
       var calls = 0;
       final provider = HostMiniAppSourceProvider(
-        pyCall: (_, _) async {
+        jarCall: (_, _, _) async {
           calls++;
           await gate.future;
           return {'list': []};
         },
       );
-      final first = provider.home('test_py_builtin');
-      final second = provider.home('test_py_builtin');
-      final third = provider.home('test_py_builtin');
+      final first = provider.home(jarSiteId);
+      final second = provider.home(jarSiteId);
+      final third = provider.home(jarSiteId);
       await expectLater(
-        provider.home('test_py_builtin'),
+        provider.home(jarSiteId),
         throwsA(
           isA<MiniAppSourceFailure>().having(
             (e) => e.code,
@@ -608,11 +877,11 @@ void main() {
 
     test('slow calls time out with TIMEOUT', () async {
       final provider = HostMiniAppSourceProvider(
-        pyCall: (_, _) => Completer<Map<String, dynamic>>().future,
+        jarCall: (_, _, _) => Completer<Map<String, dynamic>>().future,
         callTimeout: const Duration(milliseconds: 50),
       );
       await expectLater(
-        provider.home('test_py_builtin'),
+        provider.home(jarSiteId),
         throwsA(
           isA<MiniAppSourceFailure>().having(
             (e) => e.code,
@@ -764,7 +1033,6 @@ void main() {
       final home = await noBase.home('test_py_builtin');
       expect(((home['list'] as List)[0] as Map)['vod_pic'], proxyPic);
 
-      // jar 侧：登记已剥离，取数直接 SITE_NOT_FOUND，无图可改写。
       final jarProvider = HostMiniAppSourceProvider(
         imageBaseUrl: 'http://127.0.0.1:18080',
         jarCall: (_, _, _) async => {
@@ -773,16 +1041,8 @@ void main() {
           ],
         },
       );
-      await expectLater(
-        jarProvider.home(jarSiteId),
-        throwsA(
-          isA<MiniAppSourceFailure>().having(
-            (e) => e.code,
-            'code',
-            'SITE_NOT_FOUND',
-          ),
-        ),
-      );
+      final jarHome = await jarProvider.home(jarSiteId);
+      expect(((jarHome['list'] as List)[0] as Map)['vod_pic'], proxyPic);
     });
 
     test('rewrite tolerates missing, empty and non-map pics', () {
@@ -810,7 +1070,7 @@ void main() {
       );
     });
 
-    test('proxyFetch calls the proxy action for builtin py sites only',
+    test('proxyFetch calls the proxy action for py sites of any origin',
         () async {
       final seen = <Map<String, dynamic>>[];
       final provider = HostMiniAppSourceProvider(
@@ -833,27 +1093,362 @@ void main() {
       expect(seen[0]['action'], 'proxy');
       expect(seen[0]['param'], {'u': 'https://cdn.example.com/cover.jpg'});
 
+      // 汇合口径：导入/配置/jsonlist 的 py 站同样放行。
+      for (final key in [
+        'test_py_import',
+        'test_py_config',
+        'test_jsonlist_import',
+      ]) {
+        final merged = await provider.proxyFetch(key, {
+          'u': 'https://x/a.jpg',
+        });
+        expect(merged['status'], 200, reason: key);
+      }
+      expect(seen.length, 4);
+      expect(seen[3]['source'], 'test_jsonlist_import');
+
+      // 非 py 站与未知站仍报未找到，且不触发蜘蛛调用。
+      for (final key in ['test_js_import', 'no_such_site']) {
+        await expectLater(
+          provider.proxyFetch(key, {'u': 'https://x/a.jpg'}),
+          throwsA(
+            isA<MiniAppSourceFailure>().having(
+              (e) => e.code,
+              'code',
+              'SITE_NOT_FOUND',
+            ),
+          ),
+        );
+      }
+      expect(seen.length, 4);
+    });
+
+    test('native segment lists js and idj sites when the chain is injected',
+        () async {
+      SourceSite.importedJsFiles['test_js_import'] = 'test_js_import.js';
+      addTearDown(() => SourceSite.importedJsFiles.remove('test_js_import'));
+      final provider = HostMiniAppSourceProvider(
+        nativeCall: (source, operation,
+            {category = '', page = 1, query = '', vodId = '', flag = '',
+            playId = ''}) async =>
+            {},
+      );
+      final sites = await provider.listSites();
+      final keys = [for (final e in sites) e['key']];
+      expect(keys.toSet().length, keys.length);
+      final js = sites.firstWhere((e) => e['key'] == 'test_js_import');
+      expect(js['type'], 'js');
+      expect(js['name'], '导入 JS 站');
+      expect(js['searchable'], isTrue);
+      expect(js['available'], isTrue);
+      final idj = sites.firstWhere((e) => e['key'] == 'idj_testplug');
+      expect(idj['type'], 'idj');
+      expect(idj['name'], '测试插件站');
+      expect(idj['searchable'], isTrue);
+      expect(idj['available'], isTrue);
+      // 原生段在汇合段之后：排在最后一个 py 条目之后。
+      expect(
+        keys.indexOf('test_js_import') > keys.indexOf('test_jsonlist_import'),
+        isTrue,
+      );
+      expect(
+        keys.indexOf('idj_testplug') > keys.indexOf('test_jsonlist_import'),
+        isTrue,
+      );
+    });
+
+    test('js sites route through the native call with spider operations',
+        () async {
+      final seen = <String>[];
+      final provider = HostMiniAppSourceProvider(
+        nativeCall: (source, operation,
+            {category = '', page = 1, query = '', vodId = '', flag = '',
+            playId = ''}) async {
+          seen.add(
+            '$operation|cat=$category|pg=$page|q=$query|id=$vodId'
+            '|flag=$flag|play=$playId',
+          );
+          switch (operation) {
+            case 'home':
+              return {
+                'class': [
+                  {'type_id': '1', 'type_name': '电影'},
+                ],
+                'list': [
+                  {'vod_id': 'j1', 'vod_name': 'JS 片'},
+                ],
+              };
+            case 'category':
+              return {
+                'list': [
+                  {'vod_id': 'j2', 'vod_name': 'JS 分类片'},
+                ],
+              };
+            case 'search':
+              return {
+                'list': [
+                  {'vod_id': 'j3', 'vod_name': 'JS 搜片'},
+                ],
+              };
+            case 'detail':
+              return {
+                'list': [
+                  {
+                    'vod_id': 'j1',
+                    'vod_play_from': '线路A',
+                    'vod_play_url': '第1集\$e1',
+                  },
+                ],
+              };
+            case 'player':
+              return {
+                'url': 'https://cdn.example.com/js.m3u8',
+                'header': {'Referer': 'https://example.com/'},
+                'parse': 0,
+              };
+          }
+          return {};
+        },
+      );
+
+      final home = await provider.home('test_js_import');
+      expect((home['list'] as List).length, 1);
+      expect((home['classes'] as List).length, 1);
+      final category = await provider.category(
+        siteKey: 'test_js_import',
+        tid: '1',
+        page: 2,
+      );
+      expect((category['list'] as List).length, 1);
+      final search = await provider.search(
+        siteKey: 'test_js_import',
+        wd: '词',
+        page: 1,
+      );
+      expect((search['list'] as List).length, 1);
+      final detail = await provider.detail(
+        siteKey: 'test_js_import',
+        id: 'j1',
+      );
+      expect(detail['vod_id'], 'j1');
+      expect(detail['vod_play_from'], ['线路A']);
+      expect(detail['vod_play_url'], ['第1集\$e1']);
+      final play = await provider.play(
+        siteKey: 'test_js_import',
+        flag: '线路A',
+        id: 'e1',
+      );
+      expect(play['url'], 'https://cdn.example.com/js.m3u8');
+      expect(play['header'], {'Referer': 'https://example.com/'});
+      expect(play['parse'], '0');
+      expect(seen, [
+        'home|cat=|pg=1|q=|id=|flag=|play=',
+        'category|cat=1|pg=2|q=|id=|flag=|play=',
+        'search|cat=|pg=1|q=词|id=|flag=|play=',
+        'detail|cat=|pg=1|q=|id=j1|flag=|play=',
+        'player|cat=|pg=1|q=|id=|flag=线路A|play=e1',
+      ]);
+    });
+
+    test('idj sites translate the idj1 shapes', () async {
+      final seen = <String>[];
+      final provider = HostMiniAppSourceProvider(
+        nativeCall: (source, operation,
+            {category = '', page = 1, query = '', vodId = '', flag = '',
+            playId = ''}) async {
+          seen.add('$operation|cat=$category|pg=$page|q=$query|id=$vodId');
+          switch (operation) {
+            case 'home':
+              return {
+                'categories': [
+                  {'id': 'movie', 'name': '电影'},
+                  {'id': '', 'name': '坏行'},
+                  {'id': 'tv'},
+                ],
+                'items': [
+                  {
+                    'id': 'a1',
+                    'title': '插件片',
+                    'cover': 'https://img.example.com/a1.jpg',
+                    'remarks': '12集',
+                    'duration': '45分钟',
+                  },
+                  {
+                    'id': 'a2',
+                    'title': '插件片二',
+                    'cover': '',
+                    'duration': '30分钟',
+                  },
+                ],
+                'hasMore': true,
+              };
+            case 'category':
+              return {
+                'items': [
+                  {'id': 'a3', 'title': '分类片', 'cover': ''},
+                ],
+                'hasMore': false,
+              };
+            case 'search':
+              return {
+                'items': [
+                  {'id': 'a4', 'title': '搜到的插件片', 'cover': ''},
+                ],
+                'hasMore': false,
+              };
+            case 'detail':
+              return {
+                'id': 'a1',
+                'title': '插件片',
+                'cover': 'https://img.example.com/a1.jpg',
+                'desc': '简介',
+                'tags': ['动作', ''],
+                'lines': [
+                  {
+                    'name': '线路一',
+                    'episodes': [
+                      {'id': 'e1', 'name': '第1集'},
+                      {'id': 'e2'},
+                    ],
+                  },
+                  {'name': '空线路', 'episodes': []},
+                ],
+              };
+          }
+          return {};
+        },
+      );
+
+      final home = await provider.home('idj_testplug');
+      expect(home['class'], [
+        {'type_id': '', 'type_name': '全部'},
+        {'type_id': 'movie', 'type_name': '电影'},
+        {'type_id': 'tv', 'type_name': 'tv'},
+      ]);
+      expect(home['classes'], home['class']);
+      final homeList = home['list'] as List;
+      expect(homeList.length, 2);
+      expect((homeList[0] as Map)['vod_remarks'], '12集');
+      expect((homeList[1] as Map)['vod_remarks'], '30分钟');
+      expect(home['hasMore'], isTrue);
+
+      // 空分类不调 category：改走 home 取首页内容，只取第一页。
+      final homeCategory = await provider.category(
+        siteKey: 'idj_testplug',
+        tid: '',
+        page: 1,
+      );
+      expect((homeCategory['list'] as List).length, 2);
+      final beyond = await provider.category(
+        siteKey: 'idj_testplug',
+        tid: '',
+        page: 2,
+      );
+      expect(beyond['list'], isEmpty);
+      final category = await provider.category(
+        siteKey: 'idj_testplug',
+        tid: 'movie',
+        page: 1,
+      );
+      expect((category['list'] as List).length, 1);
+      expect(category['hasMore'], isFalse);
+      final search = await provider.search(
+        siteKey: 'idj_testplug',
+        wd: '插件',
+        page: 1,
+      );
+      expect((search['list'] as List).length, 1);
+
+      final detail = await provider.detail(siteKey: 'idj_testplug', id: 'a1');
+      expect(detail['vod_id'], 'a1');
+      expect(detail['vod_name'], '插件片');
+      expect(detail['vod_content'], '简介');
+      expect(detail['vod_class'], '动作');
+      expect(detail['vod_play_from'], ['线路一']);
+      expect(detail['vod_play_url'], ['第1集\$e1#e2\$e2']);
+
+      // category 只被以非空 tid 调过一次；空 tid 两页都没触发新调用。
+      expect(seen, [
+        'home|cat=|pg=1|q=|id=',
+        'home|cat=|pg=1|q=|id=',
+        'category|cat=movie|pg=1|q=|id=',
+        'search|cat=|pg=1|q=插件|id=',
+        'detail|cat=|pg=1|q=|id=a1',
+      ]);
+    });
+
+    test('idj play goes through the plan call and maps the plan', () async {
+      final seen = <String>[];
+      var drm = false;
+      final provider = HostMiniAppSourceProvider(
+        nativeCall: (source, operation,
+            {category = '', page = 1, query = '', vodId = '', flag = '',
+            playId = ''}) async =>
+            {},
+        idjPlanCall: (source, {required flag, required playId}) async {
+          seen.add('$source:$flag:$playId');
+          return PlaybackPlan(
+            url: 'https://cdn.example.com/p.m3u8',
+            headers: const {'User-Agent': 'UA'},
+            drm: drm ? const PlaybackDrm(type: 'widevine', key: 'k') : null,
+          );
+        },
+      );
+      final play = await provider.play(
+        siteKey: 'idj_testplug',
+        flag: '线路一',
+        id: 'e1',
+      );
+      expect(play['url'], 'https://cdn.example.com/p.m3u8');
+      expect(play['header'], {'User-Agent': 'UA'});
+      expect(play['parse'], '0');
+      expect(seen, ['idj_testplug:线路一:e1']);
+
+      // DRM 计划不回裸地址冒充可播，如实报失败。
+      drm = true;
       await expectLater(
-        provider.proxyFetch('test_py_config', {'u': 'https://x/a.jpg'}),
+        provider.play(siteKey: 'idj_testplug', flag: '线路一', id: 'e1'),
         throwsA(
           isA<MiniAppSourceFailure>().having(
             (e) => e.code,
             'code',
-            'SITE_NOT_FOUND',
+            'SOURCE_FAILED',
           ),
         ),
       );
+    });
+
+    test('native chain errors become SOURCE_FAILED and proxy stays closed',
+        () async {
+      final provider = HostMiniAppSourceProvider(
+        nativeCall: (source, operation,
+            {category = '', page = 1, query = '', vodId = '', flag = '',
+            playId = ''}) async =>
+            throw StateError('核调用炸了'),
+      );
       await expectLater(
-        provider.proxyFetch('no_such_site', {'u': 'https://x/a.jpg'}),
+        provider.home('test_js_import'),
         throwsA(
           isA<MiniAppSourceFailure>().having(
             (e) => e.code,
             'code',
-            'SITE_NOT_FOUND',
+            'SOURCE_FAILED',
           ),
         ),
       );
-      expect(seen.length, 1);
+      // proxyFetch 不接 JS/idj：主链没有这两类的取图代理路径。
+      for (final key in ['test_js_import', 'idj_testplug']) {
+        await expectLater(
+          provider.proxyFetch(key, {'u': 'https://x/a.jpg'}),
+          throwsA(
+            isA<MiniAppSourceFailure>().having(
+              (e) => e.code,
+              'code',
+              'SITE_NOT_FOUND',
+            ),
+          ),
+        );
+      }
     });
   });
 
