@@ -1,0 +1,300 @@
+package core
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"moyi/native/core/seku"
+)
+
+type providerMedia struct {
+	credentials     *providerMediaCredentials
+	URL             string
+	Referer         string
+	Duration        time.Duration
+	Playlist        string
+	HLSKey          []byte
+	CENCKey         []byte
+	Audio           bool
+	Quality         int
+	NeedsParse      bool
+	Subs            []playSubtitle
+	Variants        []providerMedia
+	Hook            seku.StreamHook
+	PlayAuthToken   string
+	PlayAuthExpires int64
+}
+
+func (d *Downloader) providerBaseURL(source string) string {
+	source = canonicalProviderSource(source)
+	var configured, fallback string
+	switch source {
+	case sourceHuangguoAI:
+		configured, fallback = d.cfg.HuangguoAIURL, huangguoAIBaseURL
+	case sourceHuangguoVideo:
+		configured, fallback = d.cfg.HuangguoVideoURL, huangguoVideoBaseURL
+	case sourceHuangdou:
+		configured, fallback = d.cfg.HuangdouURL, huangdouBaseURL
+	case sourceHongguo, sourceHGTV, sourceHongguoNew, sourceFanqie:
+		configured, fallback = d.cfg.HongguoURL, hongguoBaseURL
+	case sourceHuangju:
+		configured, fallback = d.cfg.HuangjuURL, huangjuBaseURL
+	case sourceYeguo:
+		configured, fallback = d.cfg.YeguoURL, yeguoBaseURL
+	case sourceDSD:
+		configured, fallback = d.cfg.DSDURL, dsdBaseURL
+	case sourceGuipian:
+		configured, fallback = d.cfg.GuipianURL, guipianSiteBaseURL
+	case sourceHanxiaoquan:
+		configured, fallback = d.cfg.HanxiaoquanURL, hanxiaoquanSiteBaseURL
+	case sourceIkanbot:
+		configured, fallback = d.cfg.IkanbotURL, ikanbotSiteBaseURL
+	case sourceA123:
+		configured, fallback = d.cfg.A123URL, a123SiteBaseURL
+	default:
+		if spec, found := duanjuSourceSpecFor(source); found {
+			return d.duanjuBaseURL(spec.ID)
+		}
+		fallback = "https://d2pypzndaqisk.cloudfront.net"
+	}
+	return strings.TrimRight(firstNonEmpty(configured, fallback), "/")
+}
+
+func providerSourceForURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	host := strings.ToLower(parsed.Hostname())
+	switch {
+	case host == "huangguoai.com" || strings.HasSuffix(host, ".ediayikma.cc") || strings.HasSuffix(host, ".agdkczeyx.cc"):
+		return sourceHuangguoAI
+	case host == "huangguo.video":
+		return sourceHuangguoVideo
+	case host == "tideember.cc" || host == "xqjurgek.top":
+		return sourceHuangdou
+	case host == "hongguoduanju.com" || host == "www.hongguoduanju.com":
+		return sourceHongguo
+	case host == "huangju.net" || host == "www.huangju.net" || host == "api.huangju.net":
+		return sourceHuangju
+	case host == "ygdj7.com" || host == "www.ygdj7.com" ||
+		host == "analyze.buxefaex.cc" || strings.HasSuffix(host, ".buxefaex.cc") ||
+		strings.HasSuffix(host, ".fzchosdi.cc") ||
+		host == "delta.ygrwdsgt.cc" || host == "yeguodj.com" || host == "www.yeguodj.com":
+		return sourceYeguo
+	case host == "dsd.com.se" || host == "www.dsd.com.se":
+		return sourceDSD
+	case host == "guipianwu.com" || host == "www.guipianwu.com":
+		return sourceGuipian
+	case host == "jennyhow.com" || host == "www.jennyhow.com":
+		return sourceHanxiaoquan
+	case host == "ikanbot.com" || host == "www.ikanbot.com" || host == "www1.ikanbot.com":
+		return sourceIkanbot
+	case host == "a123tv.com" || host == "www.a123tv.com":
+		return sourceA123
+	default:
+		return duanjuSourceForHost(host)
+	}
+}
+
+func (d *Downloader) providerURLCandidates(raw string) []string {
+	source := providerSourceForURL(raw)
+	if source == "" || source == sourceHuangju || source == sourceYeguo || isDuanjuProviderSource(source) {
+		return []string{raw}
+	}
+	parsed, _ := url.Parse(raw)
+	d.providerMu.Lock()
+	preferred := d.providerHosts[source]
+	d.providerMu.Unlock()
+	var candidates []string
+	seen := map[string]bool{}
+	add := func(candidate string) {
+		if candidate != "" && !seen[candidate] {
+			seen[candidate] = true
+			candidates = append(candidates, candidate)
+		}
+	}
+	add(rehostProviderURL(parsed, preferred))
+	configured := d.providerBaseURL(source)
+	add(rehostProviderURL(parsed, configured))
+	if providerSourceForURL(configured) == "" {
+		return candidates
+	}
+	for _, candidate := range providerURLCandidates(raw) {
+		add(candidate)
+	}
+	return candidates
+}
+
+// directMediaURL 取「集里自带的可播直链」：direct 标记 + videoUrl / id
+// / pageUrl 任一为 http(s) 地址。女优库、影视库的 m3u8_url 行走这条，
+// 不进站源解析、不受站源是否内置限制。
+func directMediaURL(chapter Chapter) string {
+	if !chapter.Direct {
+		return ""
+	}
+	for _, candidate := range []string{chapter.VideoURL, chapter.ID, chapter.PageURL} {
+		candidate = strings.TrimSpace(candidate)
+		if strings.HasPrefix(candidate, "http://") || strings.HasPrefix(candidate, "https://") {
+			return candidate
+		}
+	}
+	return ""
+}
+
+func (d *Downloader) resolveProviderMedia(ctx context.Context, task Task) (providerMedia, error) {
+	chapter := task.Chapter
+	if address := directMediaURL(chapter); address != "" {
+		media := providerMedia{URL: address, Referer: strings.TrimSpace(chapter.Referer)}
+		if media.Referer == "" {
+			if parsed, err := url.Parse(address); err == nil {
+				media.Referer = parsed.Scheme + "://" + parsed.Host + "/"
+			}
+		}
+		return media, nil
+	}
+	chapter.Source = canonicalProviderSource(chapter.Source)
+	if chapter.Source == "" {
+		chapter.Source = sourceFromDramaID(task.DramaID)
+	}
+	// v56 老条目兜底：v55 及以前的 seku 列表把内部槽名当 source 回填
+	// （hongguo / ikanbot / a123 / hanxiaoquan / guipian / huangdou /
+	// huangju / yeguo），这 8 个名字和短剧自有源同名，isSekuSource 会把
+	// 它们判成自有源，于是升级前缓存的卡点进去永远「站源无效」。
+	// 判据收紧成两条同时成立才接管：①该 source 真有同名 seku 槽；
+	// ②集标识是 http(s) 地址。短剧自有源的 id 一律不是 URL，不会误抢。
+	if !isSekuSource(chapter.Source) && seku.HasSlot(chapter.Source) {
+		if _, rawID, valid := splitProviderDramaID(task.DramaID); valid && isProviderHTTPMediaURL(rawID) {
+			aliased := sekuSourceID(chapter.Source)
+			task.DramaID = aliased + ":" + rawID
+			chapter.Source = aliased
+		}
+	}
+	if isSekuSource(chapter.Source) {
+		return d.resolveSekuMedia(ctx, task)
+	}
+	if chapter.Source == sourceCloudFront {
+		return d.resolveLegacyMedia(ctx, task)
+	}
+	if chapter.Source == sourceHuangju {
+		return d.resolveHuangjuMedia(ctx, task)
+	}
+	if chapter.Source == sourceYeguo {
+		return d.resolveYeguoMedia(ctx, task)
+	}
+	if chapter.Source == sourceDSD {
+		return d.resolveDSDMedia(ctx, task)
+	}
+	if chapter.Source == sourceGuipian {
+		return d.resolveGuipianMedia(ctx, task)
+	}
+	if chapter.Source == sourceHanxiaoquan {
+		return d.resolveHanxiaoquanMedia(ctx, task)
+	}
+	if chapter.Source == sourceIkanbot {
+		return d.resolveIkanbotMedia(ctx, task)
+	}
+	if chapter.Source == sourceA123 {
+		return d.resolveA123Media(ctx, task)
+	}
+	if isDuanjuProviderSource(chapter.Source) {
+		return d.resolveDuanjuMedia(ctx, task)
+	}
+	if chapter.Source == sourceHGTV {
+		return d.resolveHGTVMedia(ctx, task)
+	}
+	if chapter.Source == sourceHGTVMirror {
+		return d.resolveHGTVMirrorMedia(ctx, task)
+	}
+	if strings.HasPrefix(chapter.VideoURL, "hongguo-audio://") {
+		return d.resolveHongguoAudioMedia(ctx, task)
+	}
+	if strings.HasPrefix(chapter.VideoURL, "novel://hgitem:") {
+		return d.resolveHongguoNovelMedia(ctx, task)
+	}
+	if chapter.Source == sourceHongguoNew {
+		return d.resolveHongguoNewMedia(ctx, task)
+	}
+	if chapter.Source == sourceFanqie {
+		return d.resolveFanqieMedia(ctx, task)
+	}
+	if strings.HasPrefix(chapter.VideoURL, "hongguo-cenc://") {
+		return d.resolveHongguoMedia(ctx, task)
+	}
+	if chapter.PageURL == "" && (chapter.Source == sourceHuangguoAI || chapter.Source == sourceHuangguoVideo) {
+		if source, sourceID, valid := splitProviderDramaID(task.DramaID); valid {
+			_, chapters, err := d.GetHuangguoChapters(ctx, source, sourceID)
+			if err != nil {
+				return providerMedia{}, fmt.Errorf("刷新旧任务播放地址失败: %w", err)
+			}
+			matched := false
+			for _, fresh := range chapters {
+				if fresh.ID == chapter.ID {
+					chapter = fresh
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				return providerMedia{}, fmt.Errorf("原章节已变化，请更新该合集后重新下载")
+			}
+		}
+	}
+	media := providerMedia{URL: chapter.VideoURL, Referer: firstNonEmpty(chapter.Referer, d.providerBaseURL(chapter.Source)+"/")}
+	if chapter.Source == sourceHuangdou {
+		_, sourceID, valid := splitProviderDramaID(task.DramaID)
+		if valid {
+			sequence, err := strconv.Atoi(chapter.EpisodeString(task.Index))
+			if err != nil || sequence < 1 {
+				return providerMedia{}, fmt.Errorf("黄豆集数无效")
+			}
+			client := newHuangdouAPIClient(d)
+			media, err = d.resolveHuangdouPlayback(ctx, client, sourceID, sequence)
+			if err != nil {
+				return providerMedia{}, err
+			}
+			media.Referer = client.host + "/home"
+		}
+	}
+	if chapter.PageURL != "" && (chapter.Source == sourceHuangguoAI || chapter.Source == sourceHuangguoVideo) {
+		responses := &playbackResponseURLs{}
+		pageContext := context.WithValue(ctx, playbackResponseURLsKey{}, responses)
+		body, err := d.fetchProviderText(pageContext, chapter.PageURL, media.Referer)
+		if err != nil {
+			return providerMedia{}, err
+		}
+		pageURL := chapter.PageURL
+		if actual, ok := responses.values.Load(chapter.PageURL); ok {
+			pageURL = actual.(string)
+		}
+		if chapter.Source == sourceHuangguoAI {
+			media.URL = parseAIVideoURL(body, pageURL)
+		} else {
+			media.URL = parseDataHLS(body, pageURL)
+		}
+		media.Referer = pageURL
+	}
+	if !isProviderHTTPMediaURL(media.URL) {
+		return providerMedia{}, fmt.Errorf("%s 未返回有效播放地址，请刷新章节或确认站点访问权限", chapter.Source)
+	}
+	parsed, _ := url.Parse(media.URL)
+	if strings.HasSuffix(strings.ToLower(parsed.Path), ".m3u8") {
+		playlist, finalURL, err := d.fetchMediaPlaylist(ctx, media.URL, media.Referer)
+		if err != nil {
+			return providerMedia{}, fmt.Errorf("获取播放列表失败: %w", err)
+		}
+		if !strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(playlist, "\ufeff")), "#EXTM3U") {
+			return providerMedia{}, fmt.Errorf("站点未返回有效 M3U8，可能需要登录或链接已失效")
+		}
+		if duration := m3u8Duration(playlist); duration > 0 {
+			media.Duration = duration
+		}
+		media.Playlist = playlist
+		media.URL = finalURL
+	}
+	return media, nil
+}
