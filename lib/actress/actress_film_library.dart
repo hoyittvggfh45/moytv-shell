@@ -9,7 +9,10 @@ import 'package:sqflite/sqflite.dart';
 import 'actress_database.dart';
 import 'actress_generic_db.dart';
 import 'actress_json_fallback.dart';
+import 'actress_magnet_library.dart';
+import 'actress_magnet_play.dart';
 import 'actress_models.dart';
+import 'actress_online_detail.dart';
 import 'actress_working_db.dart';
 import 'actress_neon.dart';
 import 'actress_nvku_cache.dart';
@@ -653,13 +656,54 @@ class FilmLibraryService implements FilmDbFallbackProvider {
         'WHERE main_category IS NOT NULL AND main_category <> \'\' '
         'GROUP BY main_category ORDER BY c DESC',
       );
-      return [
+      final result = <(String, int)>[
         for (final row in rows)
           (
             row['main_category'].toString(),
             (row['c'] as num).toInt(),
           ),
       ];
+      // 磁力分类库的分类跟着来源登记走（2026-11-27 动态
+      // 分类）：导入了才出现、删库就消失；与主分类同名时
+      // 按并集计数，不直接相加（同番号两边都有）。
+      if (await _hasMagnetTables(db)) {
+        try {
+          final magnetRows = await db.rawQuery(
+            'SELECT ml.category AS name, '
+            'COUNT(DISTINCT mlw.vod_id) AS c '
+            'FROM magnet_libraries ml '
+            'JOIN magnet_library_works mlw '
+            'ON mlw.library_id = ml.id '
+            "WHERE TRIM(ml.category) <> '' "
+            'GROUP BY ml.category',
+          );
+          for (final row in magnetRows) {
+            final name = row['name'].toString();
+            final index = result.indexWhere((e) => e.$1 == name);
+            if (index < 0) {
+              result.add((name, (row['c'] as num).toInt()));
+            } else {
+              final unionRows = await db.rawQuery(
+                'SELECT COUNT(DISTINCT vod_id) AS c FROM ('
+                'SELECT vod_id FROM video_category '
+                'WHERE main_category = ? '
+                'UNION SELECT mlw.vod_id '
+                'FROM magnet_library_works mlw '
+                'JOIN magnet_libraries ml ON ml.id = mlw.library_id '
+                'WHERE ml.category = ?)',
+                [name, name],
+              );
+              result[index] = (
+                name,
+                (unionRows.first['c'] as num).toInt(),
+              );
+            }
+          }
+        } catch (_) {
+          // 登记读不到不拖垮原分类列表。
+        }
+      }
+      return result;
     }
     return [];
   }
@@ -708,11 +752,8 @@ class FilmLibraryService implements FilmDbFallbackProvider {
         args.add(videoTag);
       }
       if (category.isNotEmpty) {
-        where.add(
-          'v.vod_id IN (SELECT vod_id FROM video_category '
-          'WHERE main_category = ?)',
-        );
-        args.add(category);
+        where.add(await _categoryPredicate(db));
+        await _addCategoryArgs(db, args, category);
       }
       final rows = await db.rawQuery(
         'SELECT v.type_name AS name, COUNT(*) AS c FROM videos v '
@@ -778,11 +819,8 @@ class FilmLibraryService implements FilmDbFallbackProvider {
         args.add(videoTag);
       }
       if (category.isNotEmpty) {
-        where.add(
-          'v.vod_id IN (SELECT vod_id FROM video_category '
-          'WHERE main_category = ?)',
-        );
-        args.add(category);
+        where.add(await _categoryPredicate(db));
+        await _addCategoryArgs(db, args, category);
       }
       final mins = await db.rawQuery(
         'SELECT v.type_name AS name, MIN(v.vod_id) AS first_id '
@@ -858,6 +896,117 @@ class FilmLibraryService implements FilmDbFallbackProvider {
     return ((rows.first['c'] as num?)?.toInt() ?? 0) > 0;
   }
 
+  /// 磁力分类库来源登记表在不在（2026-11-27）：在，分类口径
+  /// 就要把来源登记并进主分类（见 [_categoryPredicate]）；
+  /// 不在（从没并存导入过磁力库）一切走原口径。探针按连接
+  /// 记缓存，连接换了重探（与 actress_database 同款）。
+  Database? _magnetProbeDb;
+  bool? _magnetProbeValue;
+
+  Future<bool> _hasMagnetTables(Database db) async {
+    if (identical(_magnetProbeDb, db) && _magnetProbeValue != null) {
+      return _magnetProbeValue!;
+    }
+    var result = false;
+    try {
+      final rows = await db.rawQuery(
+        "SELECT COUNT(*) AS c FROM sqlite_master "
+        "WHERE type = 'table' AND name IN "
+        "('magnet_libraries', 'magnet_library_works')",
+      );
+      result = ((rows.first['c'] as num?)?.toInt() ?? 0) >= 2;
+    } catch (_) {
+      result = false;
+    }
+    _magnetProbeDb = db;
+    _magnetProbeValue = result;
+    return result;
+  }
+
+  /// 分类谓词（2026-11-27 磁力分类库动态分类）：作品属于某
+  /// 分类的口径＝video_category 主分类 ∪ 磁力库来源登记里
+  /// 该分类带来的作品。同番号作品在主库已有别的分类时，
+  /// 磁力分类页照样能看到它；没导入的分类不出现，删库后
+  /// 登记没了、分类随之消失。没有登记表的库走原谓词。
+  Future<String> _categoryPredicate(Database db) async =>
+      await _hasMagnetTables(db)
+      ? 'v.vod_id IN (SELECT vod_id FROM video_category '
+            'WHERE main_category = ? '
+            'UNION SELECT mlw.vod_id FROM magnet_library_works mlw '
+            'JOIN magnet_libraries ml ON ml.id = mlw.library_id '
+            'WHERE ml.category = ?)'
+      : 'v.vod_id IN (SELECT vod_id FROM video_category '
+            'WHERE main_category = ?)';
+
+  /// 与 [_categoryPredicate] 配对的参数追加：并集谓词有两个
+  /// 占位符，要把分类名加两遍。
+  Future<void> _addCategoryArgs(
+    Database db,
+    List<Object?> args,
+    String category,
+  ) async {
+    args.add(category);
+    if (await _hasMagnetTables(db)) args.add(category);
+  }
+
+  /// 一部作品的全部播放线路（video_play_urls 原始行）：详情
+  /// 页判磁力线、取磁力地址用。没开库/非严格结构回空。
+  Future<List<ActressPlayLine>> playUrlsFor(String vodId) async {
+    final db = _readDb;
+    if (db == null || !isStrict) return const [];
+    try {
+      final rows = await db.rawQuery(
+        'SELECT play_url, play_from FROM video_play_urls '
+        'WHERE vod_id = ?',
+        [vodId],
+      );
+      return [
+        for (final row in rows)
+          ActressPlayLine(
+            url: row['play_url']?.toString() ?? '',
+            from: row['play_from']?.toString() ?? '',
+          ),
+      ];
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 一批作品里带磁力线路的：vod_id → 磁力地址列表（列表页
+  /// 给卡片算网盘三态用）。分批查，避开 SQLite 变量上限。
+  Future<Map<String, List<String>>> magnetUrlsForWorks(
+    List<String> vodIds,
+  ) async {
+    final db = _readDb;
+    if (db == null || !isStrict || vodIds.isEmpty) return const {};
+    final out = <String, List<String>>{};
+    for (var start = 0; start < vodIds.length; start += 400) {
+      final end = start + 400 > vodIds.length ? vodIds.length : start + 400;
+      final chunk = vodIds.sublist(start, end);
+      final placeholders = List.filled(chunk.length, '?').join(',');
+      try {
+        final rows = await db.rawQuery(
+          'SELECT vod_id, play_url, play_from FROM video_play_urls '
+          'WHERE vod_id IN ($placeholders)',
+          chunk,
+        );
+        for (final row in rows) {
+          final line = ActressPlayLine(
+            url: row['play_url']?.toString() ?? '',
+            from: row['play_from']?.toString() ?? '',
+          );
+          if (!line.isMagnet) continue;
+          final vodId = row['vod_id']?.toString() ?? '';
+          if (vodId.isEmpty) continue;
+          out.putIfAbsent(vodId, () => []).add(line.url);
+        }
+      } catch (_) {
+        return out;
+      }
+    }
+    return out;
+  }
+
   /// 列表：严格结构 SQL 直查（分类/站点/女优/关键词四筛，再加
   /// 类型名 [typeName] 与标签 [videoTag] 两筛）；通用结构走
   /// 通用读出 + 内存里按分类筛（通用读出只有标题/番号搜）。
@@ -882,11 +1031,8 @@ class FilmLibraryService implements FilmDbFallbackProvider {
       final where = <String>[];
       final args = <Object?>[];
       if (category.isNotEmpty) {
-        where.add(
-          'v.vod_id IN (SELECT vod_id FROM video_category '
-          'WHERE main_category = ?)',
-        );
-        args.add(category);
+        where.add(await _categoryPredicate(db));
+        await _addCategoryArgs(db, args, category);
       }
       if (site.isNotEmpty) {
         where.add('v.vod_play_from = ?');
@@ -954,11 +1100,8 @@ class FilmLibraryService implements FilmDbFallbackProvider {
       final where = <String>[];
       final args = <Object?>[];
       if (category.isNotEmpty) {
-        where.add(
-          'v.vod_id IN (SELECT vod_id FROM video_category '
-          'WHERE main_category = ?)',
-        );
-        args.add(category);
+        where.add(await _categoryPredicate(db));
+        await _addCategoryArgs(db, args, category);
       }
       if (site.isNotEmpty) {
         where.add('v.vod_play_from = ?');
@@ -1053,11 +1196,8 @@ class FilmLibraryService implements FilmDbFallbackProvider {
       }
       final cleanVideoCategory = videoCategory.trim();
       if (cleanVideoCategory.isNotEmpty) {
-        where.add(
-          'v.vod_id IN (SELECT vod_id FROM video_category '
-          'WHERE main_category = ?)',
-        );
-        args.add(cleanVideoCategory);
+        where.add(await _categoryPredicate(db));
+        await _addCategoryArgs(db, args, cleanVideoCategory);
       }
       final q = query.trim();
       if (q.isNotEmpty) {
@@ -1110,11 +1250,8 @@ class FilmLibraryService implements FilmDbFallbackProvider {
       }
       final cleanVideoCategory = videoCategory.trim();
       if (cleanVideoCategory.isNotEmpty) {
-        where.add(
-          'v.vod_id IN (SELECT vod_id FROM video_category '
-          'WHERE main_category = ?)',
-        );
-        args.add(cleanVideoCategory);
+        where.add(await _categoryPredicate(db));
+        await _addCategoryArgs(db, args, cleanVideoCategory);
       }
       final q = query.trim();
       if (q.isNotEmpty) {
@@ -2198,6 +2335,48 @@ class _FilmLibraryPageState extends State<FilmLibraryPage> {
       _loading = false;
       _hasMore = films.length >= _pageSize;
     });
+    unawaited(_resolveMagnetStates(films));
+  }
+
+  /// 磁力作品卡片的三态徽标（2026-11-27）：只对带磁力线路的
+  /// 作品算——快照合成（离线任务 + 已提交记录），不逐卡查
+  /// 网盘（详情页才按番号确认）。网关取不到（非生产仓库）
+  /// 就不显示徽标。
+  final _magnetStates = <String, MagnetDriveState>{};
+
+  Future<void> _resolveMagnetStates(List<FilmLibraryEntry> films) async {
+    final targets = [
+      for (final film in films)
+        if (!_magnetStates.containsKey(film.vodId)) film,
+    ];
+    if (targets.isEmpty) return;
+    final gateway = actressPan115GatewayOf(widget.repository);
+    if (gateway == null) return;
+    final urls = await _service.magnetUrlsForWorks([
+      for (final film in targets) film.vodId,
+    ]);
+    final magnets = <String, List<String>>{...urls};
+    for (final film in targets) {
+      if (actressIsMagnetPlayUrl(film.playUrl)) {
+        magnets.putIfAbsent(film.vodId, () => []).add(film.playUrl);
+      }
+    }
+    if (magnets.isEmpty) return;
+    final resolver = MagnetDriveStateResolver(gateway);
+    final snap = await resolver.snapshot();
+    if (!mounted) return;
+    setState(() {
+      for (final film in targets) {
+        final list = magnets[film.vodId];
+        if (list == null || list.isEmpty) continue;
+        _magnetStates[film.vodId] = resolver.stateFromSnapshot(
+          code: film.code.isNotEmpty ? film.code : film.vodId,
+          magnetUrls: list,
+          submitted: snap.submitted,
+          tasks: snap.tasks,
+        );
+      }
+    });
   }
 
   Future<void> _loadMore() async {
@@ -2216,6 +2395,7 @@ class _FilmLibraryPageState extends State<FilmLibraryPage> {
       _loadingMore = false;
       _hasMore = films.length >= _pageSize;
     });
+    unawaited(_resolveMagnetStates(films));
   }
 
 
@@ -2439,6 +2619,7 @@ class _FilmLibraryPageState extends State<FilmLibraryPage> {
                                 final film = _films[index];
                                 return _FilmCard(
                                   film: film,
+                                  magnetState: _magnetStates[film.vodId],
                                   onTap: () => _openFilm(film),
                                 );
                               },
@@ -2474,11 +2655,25 @@ class _CategoryChip extends StatelessWidget {
   }
 }
 
+/// 磁力三态徽标配色：可播绿、离线中橙、未下载灰。
+Color _magnetStateColor(MagnetDriveState state) => switch (state) {
+  MagnetDriveState.readyInDrive => const Color(0xFF55B16C),
+  MagnetDriveState.downloading => const Color(0xFFE8A33D),
+  MagnetDriveState.notDownloaded => const Color(0xFF9E9E9E),
+};
+
 class _FilmCard extends StatelessWidget {
-  const _FilmCard({required this.film, required this.onTap});
+  const _FilmCard({
+    required this.film,
+    required this.onTap,
+    this.magnetState,
+  });
 
   final FilmLibraryEntry film;
   final VoidCallback onTap;
+
+  /// 磁力作品的网盘三态（非磁力作品为 null，不显示徽标）。
+  final MagnetDriveState? magnetState;
 
   @override
   Widget build(BuildContext context) {
@@ -2545,13 +2740,39 @@ class _FilmCard extends StatelessWidget {
                             style: Theme.of(context).textTheme.bodySmall
                                 ?.copyWith(color: Neon.textDim),
                           ),
-                          if (!film.playable)
+                          if (!film.playable && magnetState == null)
                             Padding(
                               padding: const EdgeInsets.only(top: 4),
                               child: Text(
                                 '暂无可播地址',
                                 style: Theme.of(context).textTheme.bodySmall
                                     ?.copyWith(color: colors.error),
+                              ),
+                            ),
+                          if (magnetState != null)
+                            Padding(
+                              padding: const EdgeInsets.only(top: 6),
+                              child: Row(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  Icon(
+                                    Icons.cloud_outlined,
+                                    size: 14,
+                                    color: _magnetStateColor(magnetState!),
+                                  ),
+                                  const SizedBox(width: 4),
+                                  Text(
+                                    '115 · ${magnetState!.label}',
+                                    style: Theme.of(context)
+                                        .textTheme
+                                        .bodySmall
+                                        ?.copyWith(
+                                          color: _magnetStateColor(
+                                            magnetState!,
+                                          ),
+                                        ),
+                                  ),
+                                ],
                               ),
                             ),
                         ],
@@ -2597,10 +2818,148 @@ class _FilmDetailPageState extends State<FilmDetailPage> {
 
   FilmLibraryEntry get _entry => widget.entry;
 
+  // ---------------------------------------------------------------------
+  // 磁力线路（2026-11-27）：带磁力线路的作品多一条「磁力 ·
+  // 115 网盘」线路行，点播走网盘离线链（见 actress_magnet_play）。
+  // ---------------------------------------------------------------------
+  var _magnetUrls = const <String>[];
+  MagnetDriveState? _magnetState;
+  var _magnetBusy = false;
+  var _magnetLoaded = false;
+
+  String get _magnetCode =>
+      _entry.code.isNotEmpty ? _entry.code : _entry.vodId;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_loadMagnetState());
+  }
+
+  Future<List<String>> _collectMagnetUrls() async {
+    final lines = await widget.service.playUrlsFor(_entry.vodId);
+    final urls = <String>{};
+    for (final line in lines) {
+      if (line.isMagnet && line.url.isNotEmpty) urls.add(line.url);
+    }
+    if (actressIsMagnetPlayUrl(_entry.playUrl)) urls.add(_entry.playUrl);
+    return urls.toList();
+  }
+
+  Future<void> _loadMagnetState() async {
+    final urls = await _collectMagnetUrls();
+    if (!mounted) return;
+    setState(() {
+      _magnetUrls = urls;
+      _magnetLoaded = true;
+    });
+    if (urls.isEmpty) return;
+    final gateway = actressPan115GatewayOf(widget.repository);
+    if (gateway == null) return;
+    final state = await MagnetDriveStateResolver(
+      gateway,
+    ).resolve(code: _magnetCode, magnetUrls: urls);
+    if (!mounted) return;
+    setState(() => _magnetState = state);
+  }
+
+  /// 磁力点播：网盘有片直接播；没有自动提交离线；没登入先
+  /// 引导去网盘页登入。状态与原因都用中文实显。
+  Future<void> _playMagnet() async {
+    if (_magnetBusy) return;
+    final gateway = actressPan115GatewayOf(widget.repository);
+    if (gateway == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('这台设备上 115 网盘不可用，磁力作品暂时播不了')),
+      );
+      return;
+    }
+    var urls = _magnetUrls;
+    if (urls.isEmpty) urls = await _collectMagnetUrls();
+    if (!mounted) return;
+    if (urls.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('这部作品没有磁力链接')),
+      );
+      return;
+    }
+    setState(() => _magnetBusy = true);
+    try {
+      final outcome = await MagnetOfflinePlayFlow(
+        gateway,
+      ).play(code: _magnetCode, magnetUrls: urls);
+      if (!mounted) return;
+      switch (outcome.kind) {
+        case MagnetPlayOutcomeKind.playable:
+          setState(() => _magnetState = MagnetDriveState.readyInDrive);
+          await pushPlayer<void>(
+            context,
+            detail: DramaDetail(
+              Drama(
+                id: 'pan115:magnet:${_entry.vodId}',
+                source: 'pan115',
+                title: _entry.displayTitle,
+                tags: [_magnetCode],
+              ),
+              [
+                Episode({
+                  'id': outcome.url,
+                  'title': '正片',
+                  'direct': true,
+                  'headers': outcome.headers,
+                }, 1),
+              ],
+            ),
+            initialIndex: 0,
+            repository: widget.repository,
+            store: widget.store,
+          );
+        case MagnetPlayOutcomeKind.needsLogin:
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('115 还没登入：先去底部「网盘」页登入 115，再回来点播'),
+              duration: Duration(seconds: 5),
+            ),
+          );
+        case MagnetPlayOutcomeKind.submitted:
+          setState(() => _magnetState = MagnetDriveState.downloading);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(outcome.message)),
+          );
+        case MagnetPlayOutcomeKind.downloading:
+          setState(() => _magnetState = MagnetDriveState.downloading);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(outcome.message)),
+          );
+        case MagnetPlayOutcomeKind.failed:
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(outcome.message)),
+          );
+      }
+    } finally {
+      if (mounted) setState(() => _magnetBusy = false);
+    }
+  }
+
+  String get _magnetSubtitle => switch (_magnetState) {
+    MagnetDriveState.readyInDrive => '网盘里已有这部片，点按直接播',
+    MagnetDriveState.downloading => '离线下载中，下好后回来点播',
+    MagnetDriveState.notDownloaded => '还没下载，点按自动提交 115 离线下载',
+    null => '点按走 115 网盘离线播放',
+  };
+
   /// 点播：地址是库里刚取的。域名与库当前域名不一样时先轻量探活；
-  /// 死了就记失效并提示修复，不硬播。
+  /// 死了就记失效并提示修复，不硬播。没有直链但有磁力线路的
+  /// 作品转走磁力点播链。
   Future<void> _play() async {
     if (!_entry.playable) {
+      if (!_magnetLoaded) await _loadMagnetState();
+      if (!mounted) return;
+      if (_magnetUrls.isNotEmpty ||
+          actressIsMagnetPlayUrl(_entry.playUrl)) {
+        await _playMagnet();
+        return;
+      }
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('这条没有可播地址，可点右上角修复试试')),
       );
@@ -2796,6 +3155,8 @@ class _FilmDetailPageState extends State<FilmDetailPage> {
             subtitle: Text(
               _entry.playable
                   ? '直链播放（parse=0）'
+                  : _magnetUrls.isNotEmpty
+                  ? '磁力作品 · 走 115 网盘离线播放'
                   : '暂无可播地址',
             ),
             trailing: _checking
@@ -2807,6 +3168,32 @@ class _FilmDetailPageState extends State<FilmDetailPage> {
                 : const Icon(Icons.chevron_right),
             onTap: _checking ? null : _play,
           ),
+          if (_magnetUrls.isNotEmpty)
+            ListTile(
+              leading: const Icon(Icons.cloud_download_outlined),
+              title: const Text('磁力 · 115 网盘'),
+              subtitle: Text(_magnetSubtitle),
+              trailing: _magnetBusy
+                  ? const SizedBox(
+                      width: 20,
+                      height: 20,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : _magnetState != null
+                  ? Chip(
+                      label: Text(_magnetState!.label),
+                      labelStyle: TextStyle(
+                        color: _magnetStateColor(_magnetState!),
+                        fontSize: 12,
+                      ),
+                      side: BorderSide(
+                        color: _magnetStateColor(_magnetState!),
+                      ),
+                      visualDensity: VisualDensity.compact,
+                    )
+                  : const Icon(Icons.chevron_right),
+              onTap: _magnetBusy ? null : _playMagnet,
+            ),
         ],
       ),
     );

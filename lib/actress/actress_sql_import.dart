@@ -672,7 +672,15 @@ class ActressSqlImporter {
   /// 不白跑一遍全量聚合）。先写临时表再换名，读侧要么见旧表要么
   /// 见新表；这里跑在导入临时库上，中途失败整单导入按失败收尾、
   /// 临时文件会被清掉，不留半成品。
-  Future<void> _buildImportedRollup(SqlImportExecutor executor) async {
+  /// 名册汇总表重建的公开入口（2026-11-27 磁力分类库并存导入
+  /// 用）：并/删磁力库后作品与关联变了，汇总表要跟着重建，
+  /// 算法与整库导入落库时一字不差。
+  static Future<void> rebuildRollup(SqlImportExecutor executor) =>
+      _buildImportedRollup(executor);
+
+  static Future<void> _buildImportedRollup(
+    SqlImportExecutor executor,
+  ) async {
     final sourceCounts = await executor.query(
       'SELECT (SELECT COUNT(*) FROM actresses) AS a, '
       '(SELECT COUNT(*) FROM video_actress) AS v',

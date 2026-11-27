@@ -8,6 +8,7 @@ import 'package:path/path.dart' as path;
 import 'actress_db_export.dart';
 import 'actress_db_info.dart';
 import 'actress_db_meta.dart';
+import 'actress_magnet_library.dart';
 import 'actress_mytv_bind.dart';
 import 'actress_sql_import.dart';
 import 'actress_sql_import_controller.dart';
@@ -44,6 +45,7 @@ class ActressDbManagePage extends StatefulWidget {
     this.clearMeta,
     this.pickSqlFile,
     this.pickTableFile,
+    this.magnetStoreOpener,
   });
 
   /// 内部工作库路径。
@@ -65,6 +67,8 @@ class ActressDbManagePage extends StatefulWidget {
   final Future<void> Function()? clearMeta;
   final Future<String?> Function()? pickSqlFile;
   final Future<String?> Function()? pickTableFile;
+  final Future<MagnetLibraryStore> Function(String dbPath)?
+  magnetStoreOpener;
 
   @override
   State<ActressDbManagePage> createState() => _ActressDbManagePageState();
@@ -78,6 +82,9 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
   ActressDbImportMeta? _meta;
   var _loadingInfo = true;
   var _acting = false;
+
+  /// 已并存导入的磁力分类库（删库入口在这里，见磁力分类库区）。
+  var _magnetLibraries = const <MagnetLibraryRecord>[];
 
   /// MYTV 文件夹是否绑定成功（导出大文件可复制到那里拿走；
   /// 绑定结果由列表页启动时解析并缓存，这里只读缓存口径）。
@@ -109,10 +116,15 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     try {
       final info = await loader(widget.dbPath);
       final meta = await metaLoader();
+      var magnetLibraries = const <MagnetLibraryRecord>[];
+      if (info.exists) {
+        magnetLibraries = await _loadMagnetLibraries();
+      }
       if (!mounted) return;
       setState(() {
         _info = info;
         _meta = meta;
+        _magnetLibraries = magnetLibraries;
         _loadingInfo = false;
         // MYTV 绑定状态（导出复制用）：只读列表页启动时已解析的
         // 缓存，不在这里另起解析（不给本页刷新引入额外异步）。
@@ -121,6 +133,21 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     } catch (_) {
       if (!mounted) return;
       setState(() => _loadingInfo = false);
+    }
+  }
+
+  Future<List<MagnetLibraryRecord>> _loadMagnetLibraries() async {
+    MagnetLibraryStore? store;
+    try {
+      store = await (widget.magnetStoreOpener ??
+          _controller.magnetStoreOpener)(widget.dbPath);
+      return await store.listLibraries();
+    } catch (_) {
+      return const [];
+    } finally {
+      try {
+        await store?.close();
+      } catch (_) {}
     }
   }
 
@@ -286,6 +313,77 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
       await widget.reloadDatabase();
       _refresh();
     }
+  }
+
+  /// 并存导入磁力分类库（2026-11-27）：选 .sql 文件，控制器
+  /// 先验后并入——不替换女优库，分类名就是文件名。
+  Future<void> _startMagnetImport() async {
+    if (_blockedByBusy()) return;
+    if (_info != null && !_info!.exists) {
+      _snack('还没有女优库：先导入 .sql 数据库再导入磁力分类库');
+      return;
+    }
+    final picker = widget.pickSqlFile ?? _pickSqlFile;
+    final picked = await picker();
+    if (picked == null || picked.isEmpty) return;
+    await _controller.startMagnetImport(
+      sqlPath: picked,
+      dbPath: widget.dbPath,
+      onMerged: (_) async {
+        await widget.reloadDatabase();
+        _refresh();
+      },
+    );
+  }
+
+  /// 删除一个磁力分类库：它带来的分类与独有作品随之消失，
+  /// 女优库原有作品不受影响。
+  Future<void> _deleteMagnetLibrary(MagnetLibraryRecord record) async {
+    if (_blockedByBusy() || _acting) return;
+    final ok = await _confirm(
+      title: '删除分类库「${record.category}」？',
+      body: '删完演员库分类栏里就没有「${record.category}」这个分类了，'
+          '它带来的作品也会消失；女优库原有的作品一条都不动。',
+      action: '删除',
+    );
+    if (!ok) return;
+    setState(() => _acting = true);
+    MagnetLibraryStore? store;
+    try {
+      store = await (widget.magnetStoreOpener ??
+          _controller.magnetStoreOpener)(widget.dbPath);
+      final result = await store.removeLibrary(record.id);
+      await widget.reloadDatabase();
+      _controller.notifyDbMutated();
+      _snack(
+        '已删除分类库「${record.category}」：'
+        '带走了 ${result.removedWorks} 部它独有的作品',
+      );
+    } catch (e) {
+      _snack('删除失败：${e.toString().split('\n').first}');
+    } finally {
+      try {
+        await store?.close();
+      } catch (_) {}
+      if (mounted) setState(() => _acting = false);
+      _refresh();
+    }
+  }
+
+  String _magnetImportResultText(MagnetMergeResult result) {
+    if (!result.ok) return '导入失败：${result.error ?? '未知原因'}';
+    final String head;
+    if (result.categories.length > 1) {
+      head = '已导入 ${result.categories.length} 个分类'
+          '（${result.categories.join('、')}）：'
+          '新增 ${result.addedWorks} 部作品（共收录 ${result.totalWorks} 部）';
+    } else {
+      head = '已导入分类「${result.category}」：新增 ${result.addedWorks} 部作品'
+          '（这个分类共 ${result.totalWorks} 部）';
+    }
+    final text = StringBuffer(head);
+    if (result.replaced) text.write('；同名分类已更新为这一版');
+    return text.toString();
   }
 
   Future<void> _startExport() async {
@@ -527,6 +625,50 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
               _controller.tableUpdateResult!.summary,
             ),
           const SizedBox(height: 20),
+          _sectionTitle(textStyle, '磁力分类库'),
+          _actionRow(
+            colors: colors,
+            textStyle: textStyle,
+            title: '导入磁力分类库',
+            subtitle: '磁力 .sql 并存导入：只往女优库里加、不覆盖；'
+                '分类按文件里的分类字段逐个登记（一类一个文件时分类名就是文件名）；'
+                '导入后演员库分类栏会多出这些分类，磁力作品走 115 网盘离线播放',
+            buttonText: '导入',
+            onPressed: _controller.busy ? null : _startMagnetImport,
+          ),
+          if (_controller.magnetImportResult != null)
+            _resultText(
+              colors,
+              textStyle,
+              _magnetImportResultText(_controller.magnetImportResult!),
+            ),
+          if (_magnetLibraries.isEmpty)
+            Text(
+              '还没有导入过磁力分类库。',
+              style: textStyle.bodyMedium?.copyWith(
+                color: colors.onSurfaceVariant,
+              ),
+            )
+          else
+            for (final record in _magnetLibraries)
+              ListTile(
+                key: ValueKey('magnet-library-${record.id}'),
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.cloud_outlined),
+                title: Text(record.category),
+                subtitle: Text(
+                  '${record.works} 部 · 来源 ${record.sourceName}'
+                  '${record.importedAtMillis > 0 ? ' · 导入于 ${_formatTime(DateTime.fromMillisecondsSinceEpoch(record.importedAtMillis))}' : ''}',
+                ),
+                trailing: IconButton(
+                  icon: const Icon(Icons.delete_outline),
+                  tooltip: '删除这个分类库',
+                  onPressed: _controller.busy || _acting
+                      ? null
+                      : () => _deleteMagnetLibrary(record),
+                ),
+              ),
+          const SizedBox(height: 20),
           _sectionTitle(textStyle, '导出'),
           _actionRow(
             colors: colors,
@@ -613,6 +755,16 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
         fraction = controller.exportDone / controller.exportTotal;
       }
       onCancel = controller.cancelExport;
+    } else if (controller.magnetImportRunning) {
+      final progress = controller.magnetImportProgress;
+      if (progress != null) {
+        detail = '正在导入磁力分类库…已导入 ${progress.statements} 条'
+            '（${(progress.fraction * 100).toStringAsFixed(0)}%）';
+        fraction = progress.fraction;
+      } else {
+        detail = '正在导入磁力分类库…';
+      }
+      onCancel = controller.cancelMagnetImport;
     }
     return Card(
       margin: const EdgeInsets.only(bottom: 16),

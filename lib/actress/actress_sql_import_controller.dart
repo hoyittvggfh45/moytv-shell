@@ -5,6 +5,7 @@ import 'package:path/path.dart' as path;
 
 import 'actress_db_export.dart';
 import 'actress_db_meta.dart';
+import 'actress_magnet_library.dart';
 import 'actress_spreadsheet.dart';
 import 'actress_sql_import.dart';
 import 'actress_table_update.dart';
@@ -39,6 +40,8 @@ class ActressDbTaskController extends ChangeNotifier {
       (dbPath) => SqfliteActressTableStore.openPath(dbPath);
   Future<ActressExportStore> Function(String dbPath) exportStoreOpener =
       (dbPath) => SqfliteActressExportStore.openPath(dbPath);
+  Future<MagnetLibraryStore> Function(String dbPath) magnetStoreOpener =
+      (dbPath) => SqfliteMagnetLibraryStore.openPath(dbPath);
   Future<void> Function(ActressDbImportMeta meta) saveMeta =
       saveActressDbImportMeta;
 
@@ -89,6 +92,15 @@ class ActressDbTaskController extends ChangeNotifier {
   bool _tableCancelRequested = false;
 
   // ---------------------------------------------------------------------
+  // 磁力分类库并存导入状态（2026-11-27）
+  // ---------------------------------------------------------------------
+  bool magnetImportRunning = false;
+  ActressSqlImportProgress? magnetImportProgress;
+  MagnetMergeResult? magnetImportResult;
+  String? magnetImportError;
+  bool _magnetCancelRequested = false;
+
+  // ---------------------------------------------------------------------
   // 导出状态
   // ---------------------------------------------------------------------
   bool exportRunning = false;
@@ -99,12 +111,17 @@ class ActressDbTaskController extends ChangeNotifier {
   bool _exportCancelRequested = false;
 
   /// 任一任务在跑（删库/恢复/开新任务的拦截口径）。
-  bool get busy => sqlImportRunning || tableUpdateRunning || exportRunning;
+  bool get busy =>
+      sqlImportRunning ||
+      tableUpdateRunning ||
+      exportRunning ||
+      magnetImportRunning;
 
   String get busyLabel {
     if (sqlImportRunning) return '正在导入数据库';
     if (tableUpdateRunning) return '正在用表格更新数据库';
     if (exportRunning) return '正在导出数据库';
+    if (magnetImportRunning) return '正在导入磁力分类库';
     return '';
   }
 
@@ -326,6 +343,108 @@ class ActressDbTaskController extends ChangeNotifier {
 
   void cancelTableUpdate() {
     if (tableUpdateRunning) _tableCancelRequested = true;
+  }
+
+  // ---------------------------------------------------------------------
+  // 磁力分类库并存导入（2026-11-27 用户令）
+  // ---------------------------------------------------------------------
+
+  /// 并存导入一个磁力分类 .sql：先用整库导入器把 .sql 验过并
+  /// 落成临时库（缺表/没作品/坏语句在这一步按整库口径拦下，
+  /// 主库一字不动），再由 [MagnetLibraryStore] 并存合并进主
+  /// 库——主库已有作品一行不覆盖，只新增。库名＝所选文件名
+  /// 去后缀，演员库分类栏随之多出这个分类。
+  Future<MagnetMergeResult?> startMagnetImport({
+    required String sqlPath,
+    required String dbPath,
+    Future<void> Function(MagnetMergeResult result)? onMerged,
+  }) async {
+    if (busy) return null;
+    magnetImportRunning = true;
+    magnetImportProgress = null;
+    magnetImportResult = null;
+    magnetImportError = null;
+    _magnetCancelRequested = false;
+    notifyListeners();
+    final name = magnetLibraryNameOfFile(sqlPath);
+    final sourceName = path.basename(sqlPath);
+    final stagingPath = path.join(path.dirname(dbPath), '.magnet-staging.db');
+    MagnetMergeResult result;
+    MagnetLibraryStore? store;
+    try {
+      if (!await File(dbPath).exists()) {
+        result = const MagnetMergeResult(
+          ok: false,
+          error: '还没有女优库：先用「导入数据库」导入女优库，再导入磁力分类库',
+        );
+      } else {
+        final staged = await importerFactory().importFile(
+          sqlPath: sqlPath,
+          dbPath: stagingPath,
+          closeDatabase: () async {},
+          onProgress: (progress) {
+            magnetImportProgress = progress;
+            notifyListeners();
+          },
+          isCancelled: () => _magnetCancelRequested,
+        );
+        if (!staged.ok) {
+          result = MagnetMergeResult(
+            ok: false,
+            error: friendlySqlImportError(staged.error ?? '文件校验没通过'),
+          );
+        } else {
+          store = await magnetStoreOpener(dbPath);
+          result = await store.mergeFromStaging(
+            stagingPath: stagingPath,
+            name: name,
+            sourceName: sourceName,
+          );
+        }
+      }
+    } catch (e) {
+      result = MagnetMergeResult(
+        ok: false,
+        error: friendlySqlImportError(e.toString().split('\n').first),
+      );
+    } finally {
+      try {
+        await store?.close();
+      } catch (_) {}
+      // 临时库与它的备份/日志残件一律清掉，不留垃圾。
+      for (final leftover in [
+        stagingPath,
+        '$stagingPath.bak',
+        '$stagingPath-wal',
+        '$stagingPath-journal',
+      ]) {
+        try {
+          final file = File(leftover);
+          if (await file.exists()) await file.delete();
+        } catch (_) {}
+      }
+      magnetImportRunning = false;
+      magnetImportProgress = null;
+      notifyListeners();
+    }
+    magnetImportResult = result;
+    magnetImportError = result.ok ? null : result.error;
+    if (result.ok) {
+      dataGeneration++;
+      if (onMerged != null) {
+        try {
+          await onMerged(result);
+        } catch (_) {
+          // 页面侧收尾失败不改导入已成功的事实。
+        }
+      }
+    }
+    notifyListeners();
+    return result;
+  }
+
+  void cancelMagnetImport() {
+    if (magnetImportRunning) _magnetCancelRequested = true;
   }
 
   // ---------------------------------------------------------------------
