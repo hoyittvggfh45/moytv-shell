@@ -487,6 +487,18 @@ class CrossSiteProbeService {
     String avId,
   ) async {
     final page = await repository.searchAcross([siteId], avId);
+    // 搜索腿本身失败（站源抛错/超时）必须落 failed，不许冒充
+    // 「无此片」：混合搜索把单站失败收进 failedSources（此前
+    // 只拼进 warning 文案、探活层不看，失败全被折叠成 empty，
+    // 2026-11-27 问题 3 实报：全站假「无此片」）。
+    if (page.failedSources.contains(siteId)) {
+      return CrossSiteProbeResult(
+        provider: provider,
+        siteId: siteId,
+        status: CrossSiteProbeStatus.failed,
+        latency: Duration.zero,
+      );
+    }
     final hits = page.items
         .where(
           (drama) =>
@@ -495,6 +507,7 @@ class CrossSiteProbeService {
         .take(maxVersions)
         .toList();
     final versions = <CrossSiteVersion>[];
+    var detailFailures = 0;
     for (final hit in hits) {
       try {
         final detail = await repository.detail(hit);
@@ -512,15 +525,21 @@ class CrossSiteProbeService {
           ),
         );
       } catch (_) {
-        // 某个命中取详情失败，换下一个命中，不拖垮整家平台。
+        // 某个命中取详情失败，换下一个命中，不拖垮整家平台；
+        // 但要计数——命中全军覆没在详情腿时不能报「无此片」。
+        detailFailures++;
       }
     }
+    // 搜到了命中、却全死在取详情：是失败不是无此片。
+    final status = versions.isNotEmpty
+        ? CrossSiteProbeStatus.found
+        : (hits.isNotEmpty && detailFailures > 0)
+        ? CrossSiteProbeStatus.failed
+        : CrossSiteProbeStatus.empty;
     return CrossSiteProbeResult(
       provider: provider,
       siteId: siteId,
-      status: versions.isEmpty
-          ? CrossSiteProbeStatus.empty
-          : CrossSiteProbeStatus.found,
+      status: status,
       versions: versions,
     );
   }

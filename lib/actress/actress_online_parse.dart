@@ -145,7 +145,12 @@ String phListUrl({
 }) {
   final kw = query.trim();
   if (kw.isNotEmpty) {
-    final base = '$phSite/video/search?search=${Uri.encodeQueryComponent(kw)}';
+    // PH 搜索对大小写不敏感、且服务端会把大写关键词 301 跳到
+    // 小写地址（2026-11-27 实测 search=OFJE-712 → 301 →
+    // search=ofje-712）：直接用小写发，省一跳重定向——PH 链路
+    // 本来就慢，多一跳容易吃满 25 秒取数预算落「搜索失败」。
+    final base =
+        '$phSite/video/search?search=${Uri.encodeQueryComponent(kw.toLowerCase())}';
     return page > 1 ? '$base&page=$page' : base;
   }
   final qs = <String>[

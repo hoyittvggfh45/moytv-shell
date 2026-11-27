@@ -28,6 +28,15 @@ void main() {
         'https://cn.pornhub.com/video/search?search=abc&page=3',
       );
     });
+
+    // 2026-11-27 问题 3：PH 服务端把大写关键词 301 跳小写，
+    // 直接发小写省一跳（搜索大小写不敏感、匹配走归一口径）。
+    test('搜索：大写番号直接发小写，不吃 301 那一跳', () {
+      expect(
+        phListUrl(sortValue: '', catValue: '', query: 'OFJE-712', page: 1),
+        'https://cn.pornhub.com/video/search?search=ofje-712',
+      );
+    });
   });
 
   group('PH 列表解析', () {

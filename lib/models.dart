@@ -1010,12 +1010,19 @@ class CatalogPage {
     this.fresh = false,
     this.tags = const [],
     this.filters = const [],
+    this.failedSources = const [],
   });
   final List<Drama> items;
   final bool hasMore;
   final String warning;
   final int page;
   final bool fresh;
+
+  /// 跨站搜索里明确失败（抛错/超时）的站源 id（结构化口径，
+  /// 与给人看的 [warning] 并行）：探活层据此把「搜索失败」与
+  /// 「搜到了但没有此片」分开，不许拿失败冒充无此片
+  /// （2026-11-27 问题 3）。
+  final List<String> failedSources;
 
   /// 分类响应携带的标签集（标签一等浏览维度），渲染为可点 chip，
   /// 点击以 tag 的 folderId（tag: 前缀）下钻。

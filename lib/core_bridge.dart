@@ -2793,6 +2793,7 @@ class NativeRepository extends AppRepository {
       items,
       fresh: true,
       warning: searchAcrossFailureWarning(failures),
+      failedSources: failures,
     );
   }
 

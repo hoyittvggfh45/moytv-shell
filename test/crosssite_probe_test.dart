@@ -418,6 +418,41 @@ void main() {
       expect(result.status, CrossSiteProbeStatus.failed);
     });
 
+    // 2026-11-27 问题 3 回归：混合搜索把单站失败折叠进
+    // failedSources 正常返回（不抛错）时，探活必须落 failed，
+    // 不许冒充「无此片」——手机实报全站假「无此片」就是这条。
+    test('folded search failure (failedSources) means failed, not empty', () async {
+      repository.searchFailedSources = {'jar:zakatv:zakav01'};
+      final service = CrossSiteProbeService(repository: repository);
+      final result = await service.probeProvider(
+        av01Provider,
+        'jar:zakatv:zakav01',
+        'HMN-927',
+      );
+      expect(result.status, CrossSiteProbeStatus.failed);
+    });
+
+    // 命中全死在取详情：是失败不是无此片。
+    test('all matching hits failing detail means failed, not empty', () async {
+      repository.searchResults = {
+        'jar:zakatv:zakav01': [
+          const Drama(
+            id: 'hmn-927',
+            source: 'jar:zakatv:zakav01',
+            title: 'hmn-927',
+          ),
+        ],
+      };
+      repository.detailFailures = {'hmn-927'};
+      final service = CrossSiteProbeService(repository: repository);
+      final result = await service.probeProvider(
+        av01Provider,
+        'jar:zakatv:zakav01',
+        'HMN-927',
+      );
+      expect(result.status, CrossSiteProbeStatus.failed);
+    });
+
     test('per-site timeout means failed', () async {
       repository.hangSearch = true;
       final service = CrossSiteProbeService(
@@ -1023,6 +1058,10 @@ class _ProbeFakeRepository extends FixtureRepository {
   Map<String, DramaDetail> detailResults = {};
   Map<String, Duration> searchDelays = {};
   Set<String> searchFailures = {};
+
+  /// 混合搜索口径：不抛错、把失败站记进 CatalogPage.failedSources
+  /// 正常返回（复刻 core_bridge 混合腿的折叠形态）。
+  Set<String> searchFailedSources = {};
   Set<String> detailFailures = {};
   Set<String> hangSites = {};
   bool hangSearch = false;
@@ -1045,7 +1084,13 @@ class _ProbeFakeRepository extends FixtureRepository {
     for (final source in sources) {
       items.addAll(searchResults[source] ?? const []);
     }
-    return CatalogPage(items);
+    return CatalogPage(
+      items,
+      failedSources: [
+        for (final source in sources)
+          if (searchFailedSources.contains(source)) source,
+      ],
+    );
   }
 
   @override
