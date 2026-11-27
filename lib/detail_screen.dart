@@ -1140,8 +1140,7 @@ class _DetailScreenState extends State<DetailScreen> {
     if (rawDetail == null ||
         index < 0 ||
         index >= rawDetail.episodes.length ||
-        _profileEpoch != widget.store.profileEpoch ||
-        !widget.store.allowsSource(rawDetail.drama.source)) {
+        _profileEpoch != widget.store.profileEpoch) {
       return;
     }
     // 播放优先：停掉后台取帧（取帧解析与播放解析共用序列号通道），
@@ -1239,8 +1238,7 @@ class _DetailScreenState extends State<DetailScreen> {
   Future<void> _playCrossSite(DramaDetail detail, int index) async {
     if (index < 0 ||
         index >= detail.episodes.length ||
-        _profileEpoch != widget.store.profileEpoch ||
-        !widget.store.allowsSource(detail.drama.source)) {
+        _profileEpoch != widget.store.profileEpoch) {
       return;
     }
     _frameService.cancel();
@@ -1351,8 +1349,8 @@ class _DetailScreenState extends State<DetailScreen> {
 
   /// 在线线路起播：解析/嗅探只负责取链，地址连请求头递给
   /// 正式播放器（pushPlayer），不在网页里播（2026-11-26
-  /// 16:59 令）。这两源未在站点表注册，allowsSource 门不适
-  /// 用，走与在线视图点卡相同的直递播放器路径。
+  /// 16:59 令）。这两源未在站点表注册，走与在线视图点卡相同
+  /// 的直递播放器路径（源门禁已于 2026-11-27 整体删除）。
   Future<void> _playActressOnlineLine(DramaDetail detail) async {
     _frameService.cancel();
     await pushPlayer<void>(
@@ -1562,9 +1560,10 @@ class _DetailScreenState extends State<DetailScreen> {
     // 或回空时退回选集 UI（_folderFailed 为真）并在选集区上方提示重试。
     final showFolder = _isFolderDrama(drama) && !_folderFailed;
     final television = AppLayout.isTelevision(context);
-    final allowed =
-        widget.store.profileEpoch == _profileEpoch &&
-        widget.store.allowsSource(drama.source);
+    // 源访问门禁已整体删除（2026-11-27 用户令「把门禁全删除」）：
+    // 详情页不再有「当前用户无权访问」面板，任何来源的作品都照常
+    // 出内容、照常可播。身份代际（profileEpoch）只用于切身份时
+    // 让旧页数据失效，不再参与准入判断。
     // 内嵌全屏时顶栏连占位一起藏掉：只改 Scaffold 的 appBar 槽位，
     // body 的树位置不动，播区全程挂在同一条链上（见 _embeddedArea）。
     // 以前全屏分支直接返回另一套 Scaffold，把播放器从 Column 里的
@@ -1582,7 +1581,7 @@ class _DetailScreenState extends State<DetailScreen> {
               RefreshAction(
                 loading: _loading,
                 tooltip: '更新剧集信息',
-                onPressed: allowed ? _load : null,
+                onPressed: _load,
               ),
             ],
           );
@@ -1616,12 +1615,6 @@ class _DetailScreenState extends State<DetailScreen> {
                 constraints: const BoxConstraints(maxWidth: 1200),
                 child: LayoutBuilder(
                   builder: (context, constraints) {
-                    if (!allowed) {
-                      return const StatusPanel(
-                        title: '当前用户无权访问',
-                        message: '请返回剧库后重新选择。',
-                      );
-                    }
                     if (television || constraints.maxWidth >= 960) {
                       return Row(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -1777,10 +1770,9 @@ class _DetailScreenState extends State<DetailScreen> {
                                     // 播放器；115 下载中也放行，点按给百分
                                     // 比提示（_playFromPoster）。
                                     ready:
-                                        allowed &&
-                                        (episodes.isNotEmpty ||
-                                            _pan115File != null ||
-                                            _pan115Submitted),
+                                        episodes.isNotEmpty ||
+                                        _pan115File != null ||
+                                        _pan115Submitted,
                                     resumeIndex: resumeIndex,
                                   ),
                                 ),

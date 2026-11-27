@@ -632,14 +632,8 @@ class HtmlBridge {
         'html sites have no detail engine',
       );
     }
-    if (!store.allowsSource(targetSite)) {
-      // 当前用户档案不可见/不可用的站（如未成年保护锁定时），
-      // 不许经 HTML 桥绕过门禁打开。
-      throw const HtmlBridgeError(
-        'unsupported',
-        'site not available for the current profile',
-      );
-    }
+    // 源门禁已整体删除（2026-11-27 用户令）：HTML 桥打开详情不再
+    // 按当前档案的 source 准入拦，显示偏好与访问彻底脱钩。
     host.pushPage(
       DetailScreen(
         drama: Drama(

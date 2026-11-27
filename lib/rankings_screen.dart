@@ -117,7 +117,6 @@ class _RankingsScreenState extends State<RankingsScreen> {
     try {
       final allowed = widget.sourceIds;
       final boards = (await widget.repository.rankingBoards())
-          .where((board) => widget.store.allowsSource(board.source))
           .where((board) => allowed == null || allowed.contains(board.source))
           .toList();
       if (!mounted || generation != _generation) return;
@@ -217,7 +216,6 @@ class _RankingsScreenState extends State<RankingsScreen> {
         )
         .where(
           (item) =>
-              widget.store.allowsSource(item.drama.source) &&
               !(item.drama.source == 'huangdou' &&
                   widget.store.hideVip &&
                   item.drama.vip),

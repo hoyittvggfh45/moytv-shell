@@ -113,16 +113,12 @@ class BatchDownloads extends ChangeNotifier {
         if (!_valid || stopping) break;
         if (!item.selected || item.detail != null) continue;
         item.error = null;
-        if (!store.allowsSource(item.drama.source)) {
-          item.error = '当前用户没有此站源权限';
-          continue;
-        }
         current = item;
         item.loading = true;
         _notify();
         try {
           final detail = await repository.detail(item.drama);
-          if (!_valid || !store.allowsSource(item.drama.source)) break;
+          if (!_valid) break;
           if (detail.drama.id != item.drama.id ||
               detail.drama.source != item.drama.source) {
             throw AppFailure('返回的剧集信息不匹配，请重试');
@@ -174,17 +170,13 @@ class BatchDownloads extends ChangeNotifier {
       for (final item in items) {
         if (!_valid || stopping) break;
         if (!item.selected || item.detail == null) continue;
-        if (!store.allowsSource(item.drama.source)) {
-          item.error = '当前用户没有此站源权限';
-          continue;
-        }
         final episodes = item.pending(includeVip);
         if (episodes.isEmpty) continue;
         item.error = null;
         current = item;
         _notify();
         for (var offset = 0; offset < episodes.length; offset += 500) {
-          if (!_valid || stopping || !store.allowsSource(item.drama.source)) {
+          if (!_valid || stopping) {
             break;
           }
           final chunk = episodes.sublist(

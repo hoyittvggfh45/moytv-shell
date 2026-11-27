@@ -798,9 +798,7 @@ class _PlayerScreenState extends State<PlayerScreen>
       unawaited(_player.pause());
     }
     if (!_closed &&
-        (widget.store.profileEpoch != _profileEpoch ||
-            widget.store.locked ||
-            !widget.store.allowsSource('hongguo'))) {
+        (widget.store.profileEpoch != _profileEpoch || widget.store.locked)) {
       _danmaku.setPlan(null);
     }
   }
@@ -1462,8 +1460,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           _error == null &&
           _openedIndex == _index &&
           widget.store.profileEpoch == _profileEpoch &&
-          !widget.store.locked &&
-          widget.store.allowsSource('hongguo'),
+          !widget.store.locked,
       discontinuity: discontinuity,
     );
   }

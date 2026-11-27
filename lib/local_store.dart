@@ -181,7 +181,10 @@ class LocalStore extends ChangeNotifier {
   bool get locked => _locked || _configurationError != null;
   int get profileEpoch => _epoch;
 
-  bool get canDownload => !locked && (profile.admin || profile.download);
+  // 下载权限判定已删（2026-11-27 用户令「把门禁全删除」）：下载
+  // 不再被 profile 的 admin/download 标志挡；只保留配置损坏待恢复
+  // （locked）这一条整店失效保护，那不是源门禁。
+  bool get canDownload => !locked;
   WatchStats get watchStats {
     if (locked) return const WatchStats();
     try {
@@ -193,15 +196,15 @@ class LocalStore extends ChangeNotifier {
     }
   }
 
+  /// 源访问门禁已整体删除（2026-11-27 用户令「把门禁全删除」）：
+  /// 任何内容不得再因 source 准入被拦——不再查 isAvailable、不再
+  /// 查 profile.allows。方法保留只为兼容既有调用点，恒放行；
+  /// 唯一例外是配置损坏待恢复（locked）的整店失效保护，那不是
+  /// 源门禁。站点的显示/隐藏是用户自己的展示偏好（hiddenSites /
+  /// siteVisible / visibleSources），与本判定彻底脱钩、照旧保留。
   bool allowsSource(String source) {
     if (locked) return false;
-    if (!SourceSite.isAvailable(source)) return false;
-    // 自定义源为设备级功能，管理员与普通用户均可使用。
-    if (SourceSite.isCustomId(source)) return true;
-    if (SourceSite.importedSites.containsKey(source)) return true;
-    // 网盘站源为设备级功能：登录本身就是门禁，管理员与普通用户均可使用。
-    if (SourceSite.cloudDriveSites.containsKey(source)) return true;
-    return profile.allows(source);
+    return true;
   }
 
   List<SourceSite> get sources {

@@ -74,10 +74,7 @@ Future<void> showDramaActions(
         ),
     ],
   );
-  if (choice == null ||
-      !context.mounted ||
-      epoch != store.profileEpoch ||
-      !store.allowsSource(drama.source)) {
+  if (choice == null || !context.mounted || epoch != store.profileEpoch) {
     return;
   }
   if (choice.startsWith('status:')) {

@@ -173,9 +173,8 @@ class RecommendationService extends ChangeNotifier {
     if (filter.chosen) {
       _sources = filter.sources;
     } else {
-      _sources = (store.allowsSource(recommendationDefaultSource))
-          ? {recommendationDefaultSource}
-          : <String>{};
+      // 源门禁已删（2026-11-27 用户令）：默认推荐源恒可用。
+      _sources = {recommendationDefaultSource};
     }
     _sourceFocus = _sources.isEmpty ? recommendationAllSources : _sources.last;
     _categoryFilter = filter.category;
@@ -299,7 +298,6 @@ class RecommendationService extends ChangeNotifier {
     final local = _local;
     if (local == null) return;
     final drama = entry.drama;
-    if (!local.allowsSource(drama.source)) return;
     if (drama.id.isEmpty || drama.title.isEmpty) return;
     if (!drama.cover.startsWith('http')) return;
     final now = _nowSeconds();
@@ -550,9 +548,7 @@ class RecommendationService extends ChangeNotifier {
   }
 
   void _applyFilters() {
-    final local = _local;
     final scoped = _feed.where((item) {
-      if (local != null && !local.allowsSource(item.source)) return false;
       if (_sources.isEmpty) return true;
       return _sources.contains(item.groupId);
     }).toList();

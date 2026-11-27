@@ -44,8 +44,9 @@ class ActressPlayCandidate {
 ///   尚未起跑的波次不再起跑、直接判无源，在途探活跑完、结果照收；
 /// - 无番号的作品走标题模式：按标题搜全部可见站，取标题相符的命中
 ///   （每站首个）成链，其余流程相同；
-/// - 每推一个候选前都查 [LocalStore.allowsSource] 并校验 profileEpoch
-///   未变（与详情页 `_playCrossSite` 同一范式），用户切了身份立即停；
+/// - 每推一个候选前都校验 profileEpoch 未变（与详情页
+///   `_playCrossSite` 同一范式），用户切了身份立即停；源准入
+///   过滤已随门禁整体删除（2026-11-27 用户令），不再按 source 滤候选；
 /// - 播放中途恢复耗尽时，播放器回调里继续调 [nextPlayable] 换下一个，
 ///   链耗尽才让播放器原错误界面留着；
 /// - 来源信息只在内部流转，调用方绝不向界面暴露候选的站源身份。
@@ -213,7 +214,8 @@ class ActressPlayChain {
       if (store.profileEpoch != profileEpoch) return null;
       if (_next < _candidates.length) {
         final candidate = _candidates[_next++];
-        if (!store.allowsSource(candidate.detail.drama.source)) continue;
+        // 源门禁已整体删除（2026-11-27 用户令）：候选不再按
+        // source 准入过滤，只保留身份代际校验（切身份即停）。
         if (await _resolves(candidate, profileEpoch)) return candidate;
         continue;
       }

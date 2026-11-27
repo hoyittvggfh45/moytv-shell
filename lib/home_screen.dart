@@ -577,13 +577,10 @@ class _HomeScreenState extends State<HomeScreen>
         _changedSources.clear();
         final updates = <String, Drama>{};
         for (final source in sources) {
-          if (!widget.store.allowsSource(source)) continue;
           try {
             final cached = await widget.repository.cached(source);
             for (final drama in cached.items) {
-              if (widget.store.allowsSource(drama.source)) {
-                updates[drama.id] = drama;
-              }
+              updates[drama.id] = drama;
             }
           } catch (error) {
             if (mounted && epoch == widget.store.profileEpoch) {
@@ -1379,7 +1376,7 @@ class _HomeScreenState extends State<HomeScreen>
 
   void _metadataChanged() {
     final drama = widget.repository.catalogUpdates.latest;
-    if (!mounted || drama == null || !widget.store.allowsSource(drama.source)) {
+    if (!mounted || drama == null) {
       return;
     }
     _browser.updateDrama(drama);
@@ -2325,7 +2322,8 @@ class _HomeScreenState extends State<HomeScreen>
     final hidden = widget.store.hiddenSites;
     final visible = sortCatalog(
       _items.where((drama) {
-        if (!widget.store.allowsSource(drama.source)) return false;
+        // 源门禁已删（2026-11-27 用户令）：此处只剩显示偏好
+        // （hidden 是用户自己设的隐藏名单，属展示层，保留）。
         if (hidden.contains(drama.source)) return false;
         if (_category.startsWith('local:') &&
             categoryName(drama.category) != _category.substring(6)) {

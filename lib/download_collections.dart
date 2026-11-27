@@ -101,7 +101,9 @@ class DownloadCollectionUpdater extends ChangeNotifier {
   bool get valid =>
       !_disposed && store.canDownload && store.profileEpoch == _epoch;
   void _check(String source) {
-    if (!valid || _stop || !store.allowsSource(source)) {
+    // 源门禁已删（2026-11-27 用户令）：此处只剩有效性/停止检查，
+    // 不再按 source 准入拦合集更新。
+    if (!valid || _stop) {
       throw AppFailure('更新已停止；已加入的任务保留');
     }
   }

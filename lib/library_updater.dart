@@ -65,7 +65,7 @@ class LibraryUpdater extends ChangeNotifier {
   }
 
   void _accept(SourceStatus status, {bool submitted = false}) {
-    if (!_valid || !store.allowsSource(status.source)) return;
+    if (!_valid) return;
     _statuses[status.source] = status;
     _errors.remove(status.source);
     final revision =
@@ -120,7 +120,7 @@ class LibraryUpdater extends ChangeNotifier {
     final selected = sources
         .map((source) => source.id)
         .toSet()
-        .where((source) => store.allowsSource(source) && !busy(source))
+        .where((source) => !busy(source))
         .toList();
     for (final source in selected) {
       _stopRequested.remove(source);
@@ -131,7 +131,7 @@ class LibraryUpdater extends ChangeNotifier {
     _notify();
     try {
       for (final source in selected) {
-        if (!_valid || !store.allowsSource(source)) break;
+        if (!_valid) break;
         try {
           if (_stopRequested.contains(source)) continue;
           final status = await repository.startSourceJob(source, 'update');
@@ -156,12 +156,11 @@ class LibraryUpdater extends ChangeNotifier {
     final selected = sources.toList();
     if (!_valid) return;
     for (final source in selected) {
-      if (store.allowsSource(source.id)) _stopRequested.add(source.id);
+      _stopRequested.add(source.id);
     }
     for (final source in selected) {
       if (!_valid) return;
-      if (!store.allowsSource(source.id) ||
-          _pending.contains(source.id) ||
+      if (_pending.contains(source.id) ||
           _statuses[source.id]?.running != true) {
         continue;
       }

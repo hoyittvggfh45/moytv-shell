@@ -2003,16 +2003,12 @@ class NativeRepository extends AppRepository {
   @override
   Future<List<RankingBoard>> rankingBoards() async {
     final result = await _call({'action': 'rankingBoards'});
+    // 门禁已删（2026-11-27 用户令）：榜单不再按 source 准入过滤，
+    // 核给什么榜就列什么榜。
     return [
-          for (final row in result['items'] as List? ?? [])
-            RankingBoard.fromJson(Map<String, dynamic>.from(row as Map)),
-        ]
-        .where(
-          (board) =>
-              SourceSite.isAvailable(board.source) &&
-              (access?.allowsSource(board.source) ?? true),
-        )
-        .toList();
+      for (final row in result['items'] as List? ?? [])
+        RankingBoard.fromJson(Map<String, dynamic>.from(row as Map)),
+    ];
   }
 
   @override
@@ -2192,23 +2188,13 @@ class NativeRepository extends AppRepository {
     return (result as Map)['removed'] as int? ?? 0;
   }
 
-  void _authorize(String source, {bool download = false}) {
-    if (!SourceSite.isAvailable(source)) {
-      throw AppFailure('当前版本不包含此站源');
-    }
-    if (access == null) return;
-    if (access!.locked ||
-        !access!.allowsSource(source) ||
-        download && !access!.canDownload) {
-      throw AppFailure('当前用户没有此操作权限');
-    }
-  }
+  /// 源准入授权已整体删除（2026-11-27 用户令「把门禁全删除」）：
+  /// 目录/详情/取流/下载等内容路径不再因 source 或 profile 权限
+  /// 抛错。方法与全部调用点保留（签名不变），判定体清空。
+  void _authorize(String source, {bool download = false}) {}
 
-  void _downloadPermission() {
-    if (access != null && (access!.locked || !access!.canDownload)) {
-      throw AppFailure('当前用户仅支持在线观看');
-    }
-  }
+  /// 下载权限判定已整体删除（同上）：不再因 profile 权限挡下载。
+  void _downloadPermission() {}
 
   @override
   Future<List<String>> suggestions(String query) async {
@@ -3421,14 +3407,11 @@ class NativeRepository extends AppRepository {
   @override
   Future<List<DownloadJob>> downloads() async {
     final result = await _call({'action': 'downloads'});
+    // 门禁已删（2026-11-27 用户令）：下载任务不再按 source 准入
+    // 过滤，核里有的任务全列。
     return (result['jobs'] as List? ?? [])
         .whereType<Map>()
         .map((value) => DownloadJob.fromJson(Map<String, dynamic>.from(value)))
-        .where(
-          (job) =>
-              SourceSite.isAvailable(job.drama.source) &&
-              (access == null || access!.allowsSource(job.drama.source)),
-        )
         .toList();
   }
 

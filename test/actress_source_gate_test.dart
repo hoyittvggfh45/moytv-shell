@@ -1,15 +1,17 @@
-// 演员库内部源门禁回归测试（2026-11-26 发版实报修复）：
-// 演员库整批新接的 6 个源 id（javdb / av123 / ph / av01 /
-// jable / pan115）此前没在任何登记表里登记，详情页源门禁
-// allowsSource 对它们恒为假——从演员库点开任何作品都误落
-// 「当前用户无权访问」面板（诊断报告 moyi_noperm_diag_
-// 20261126）。修法是给 6 个 id 建演员库专用登记
-// （SourceSite.actressOnlySites），不进选站列表、不放宽
-// allowsSource 本身。
+// 演员库内部源登记 + 门禁删除回归测试（2026-11-26 立、
+// 2026-11-27 改口径）：演员库整批新接的 6 个源 id（javdb /
+// av123 / ph / av01 / jable / pan115）有演员库专用登记
+// （SourceSite.actressOnlySites），不进选站列表，登记供
+// isAvailable / isKnown / byId 识别与站名解析。
 //
-// 本测试的口径是上一轮漏检的反面：全程按正式 App 的真实
-// 登记状态跑——新建空 LocalStore、不往任何登记表里塞测试
-// 侧条目。谁把专用登记删了，这批测试立刻红。
+// 2026-11-27 用户令「把门禁全删除」：源访问门禁整体删除——
+// allowsSource 对任何 source（含未注册 id）恒放行，详情页
+// 「当前用户无权访问」面板路径已删。本测试现钉两件事：
+// 专用登记还在（识别/解析不退化）、门禁确实没了（谁把
+// allowsSource 的拦截逻辑加回来，这批测试立刻红）。
+//
+// 全程按正式 App 的真实登记状态跑——新建空 LocalStore、
+// 不往任何登记表里塞测试侧条目。
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -56,15 +58,17 @@ void main() {
       }
     });
 
-    test('allowsSource 对 6 个 id 放行、对未注册 id 照旧拦', () async {
+    test('allowsSource 对 6 个 id 与未注册 id 一律放行（门禁已删）', () async {
       SharedPreferences.setMockInitialValues({});
       final store = LocalStore(await SharedPreferences.getInstance());
       addTearDown(store.dispose);
       for (final id in _actressIds) {
         expect(store.allowsSource(id), isTrue, reason: id);
       }
+      // 登记表语义保留：未注册 id 仍不算「可用/已知」；但门禁
+      // 已删，allowsSource 不再据此拦截。
       expect(SourceSite.isAvailable('unregistered-random-id'), isFalse);
-      expect(store.allowsSource('unregistered-random-id'), isFalse);
+      expect(store.allowsSource('unregistered-random-id'), isTrue);
     });
 
     test('6 个 id 不进选站列表，网盘 cloud:pan115 不受牵连', () async {
@@ -82,7 +86,7 @@ void main() {
     });
   });
 
-  group('详情页进页门禁（正式状态）', () {
+  group('详情页进页（门禁已删，正式状态）', () {
     for (final id in _actressIds) {
       testWidgets('source=$id 的作品进详情页出内容、不落没权限面板', (
         tester,
@@ -112,7 +116,9 @@ void main() {
       });
     }
 
-    testWidgets('未注册随机 id 的作品仍被门禁拦下', (tester) async {
+    testWidgets('未注册随机 id 的作品进详情页照常出内容（门禁已删）', (
+      tester,
+    ) async {
       viewport(tester);
       final store = await createStore();
       const drama = Drama(
@@ -131,7 +137,8 @@ void main() {
         ),
       );
       await _settle(tester);
-      expect(find.text('当前用户无权访问'), findsOneWidget);
+      expect(find.text('当前用户无权访问'), findsNothing);
+      expect(find.text('未注册来源作品'), findsWidgets);
       expect(tester.takeException(), isNull);
       await tester.pumpWidget(const SizedBox.shrink());
     });

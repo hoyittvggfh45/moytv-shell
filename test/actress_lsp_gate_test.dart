@@ -1,13 +1,14 @@
-// 本地库 lsp 作品门禁回归测试（2026-11-27 用户实报修复）：
-// 女优库定版里 vod_play_from='lsp' 的作品有 107,844 部（占
-// 24%），ActressJsonEntry.toDramaDetail 对它不做映射、原样
-// 当 Drama.source='lsp'，而 'lsp' 此前在任何登记表里都不
-// 存在，详情页进页门禁 allowsSource 恒为假——点开必落
-// 「当前用户无权访问」面板（whos.tv 那批经 spiderIdForSite
-// 映射到已登记的 chaoliu 所以能播，形态吻合）。
-// 修法：'lsp' 补进 SourceSite.actressOnlySites 专用登记表
-// （它只是库内数据来源标记，不进选站列表），allowsSource
-// 本身不放宽。
+// 本地库 lsp 作品回归测试（2026-11-27 用户实报修复、同日
+// 改口径）：女优库定版里 vod_play_from='lsp' 的作品有
+// 107,844 部（占 24%），ActressJsonEntry.toDramaDetail 对它
+// 不做映射、原样当 Drama.source='lsp'。'lsp' 已补进
+// SourceSite.actressOnlySites 专用登记表（它只是库内数据
+// 来源标记，不进选站列表），供识别与站名解析。
+//
+// 当日后续：用户令「把门禁全删除」，源访问门禁整体删除，
+// allowsSource 恒放行、详情页无权访问面板路径已删。本测试
+// 现钉：lsp 登记还在（识别不退化）＋ lsp 作品进详情页出
+// 内容不落面板（门禁删除后照样成立，且不再依赖登记喂门禁）。
 //
 // 口径同 actress_source_gate_test：全程按正式 App 的真实
 // 登记状态跑，不做任何测试侧登记。

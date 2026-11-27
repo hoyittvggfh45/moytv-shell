@@ -252,9 +252,11 @@ class SourceSite {
   /// Drama 用这批 id 作 source。它们是演员库模块内部源、不是
   /// 片库可切换站点：不进 values / knownValues / allValues，
   /// LocalStore.sources 也不读本表，所以不会出现在选站列表
-  /// 里；登记只为让 isAvailable / isKnown / byId 认它们——否则
-  /// 详情页源门禁（allowsSource）对这批 id 恒为假，从演员库
-  /// 点开任何作品都误落「当前用户无权访问」面板。
+  /// 里；登记让 isAvailable / isKnown / byId 认它们（站名解析、
+  /// 档案源清单过滤都靠它）。
+  /// 历史注记：本表最初是为喂详情页源门禁（allowsSource）而建；
+  /// 门禁已于 2026-11-27 按用户令整体删除，本表自此只作识别与
+  /// 名称解析用，不再承担任何准入作用。
   /// 注意 pan115 是演员库 115 线的内部 id，与网盘站的
   /// cloud:pan115 是两个 id，不要混。
   static const Map<String, SourceSite> actressOnlySites = {
@@ -276,9 +278,9 @@ class SourceSite {
     ),
     // 本地女优库里 vod_play_from='lsp' 的那批作品（定版库
     // 107,844 部、占 24%）：toDramaDetail 对它不做映射、原样
-    // 当 Drama.source，此前全仓零登记，点开必落「当前用户
-    // 无权访问」面板（2026-11-27 用户实报）。它只是库内数据
-    // 来源标记、不是片库可切换站点，故只进这张专用登记表。
+    // 当 Drama.source。它只是库内数据来源标记、不是片库可
+    // 切换站点，故只进这张专用登记表作识别用（源门禁已于
+    // 2026-11-27 整体删除，本登记不再承担准入作用）。
     'lsp': SourceSite(
       'lsp',
       '本地库',
@@ -340,7 +342,7 @@ class SourceSite {
     // 旧内置站 id 已随 2026-11-26 空壳片库剥离失效，一并清掉；
     // 下面只剩 idj 成人站（只影响从未配过隐藏列表的新用户；已配过的用户以存档值为准）：
     // 默认不显示，要在源显示列表里手动打开才可见。只是默认不显示，
-    // 不是访问控制（导入站走 allowsSource 直接放行）。
+    // 不是访问控制（源门禁已于 2026-11-27 整体删除，隐藏纯属展示偏好）。
     'idj_chaoliu',
     'idj_ai2048',
     'idj_porntube',
