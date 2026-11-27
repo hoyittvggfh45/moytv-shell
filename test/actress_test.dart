@@ -1262,12 +1262,14 @@ void main() {
       expect(find.text('演员排行榜'), findsOneWidget);
     });
 
-    testWidgets('详情页 json 索引补库里没有的作品', (tester) async {
-      // 星冬香在 who's 演员映射里有 JUR-487 / JUVR-316 等番号，
-      // 但库里只给她 1 部测试作品：详情页首屏先出库里那部，
-      // 索引建好后把 json 里有、库里没有的作品补到列表末尾。
-      // 索引加载是真异步（26MB 目录解压 + 解析要数秒），
-      // pumpAndSettle 不等它：用真时间轮询等补充作品出现。
+    testWidgets('详情页不补库里没有的作品（2026-11-27 撤内置索引）', (
+      tester,
+    ) async {
+      // 星冬香在旧内置 who's 演员映射里有 JUR-487 / JUVR-316 等
+      // 番号，库里只给她 1 部测试作品。2026-11-27 用户令撤掉
+      // 内置 who's 数据后，详情页只出数据库作品（另有 JavDB 补，
+      // 测试环境无 JavDB 结果）：库里没有的番号不再凭空补出。
+      // 给后台补充链留出真时间窗口后再断言缺席，防假阴性。
       final person = await seedPerson('星冬香', works: 1);
       await tester.pumpWidget(
         MaterialApp(
@@ -1283,26 +1285,15 @@ void main() {
       // 2026-11-26 AvWorkCard：无封面无标题的作品，番号同时
       // 出现在标题位、番号行与封面占位上（都是同一张卡）。
       expect(find.text('TST-1'), findsWidgets);
-      for (var i = 0; i < 60; i++) {
-        if (find.text('JUR-487').evaluate().isNotEmpty) break;
+      for (var i = 0; i < 10; i++) {
         await tester.runAsync(() async {
           await Future<void>.delayed(const Duration(milliseconds: 500));
         });
         await tester.pump(const Duration(milliseconds: 100));
       }
-      expect(find.text('JUR-487'), findsOneWidget);
-      // 2026-11-26：AvWorkCard 三列格比基线高，补进来的作品
-      // 排在末尾、第二行起懒加载才建——滚动轮询等它出现
-      // （断言本意是“补进了列表”，不是“一屏全建”）。
-      for (var i = 0; i < 30; i++) {
-        if (find.text('JUVR-316').evaluate().isNotEmpty) break;
-        await tester.drag(
-          find.byType(CustomScrollView),
-          const Offset(0, -500),
-        );
-        await tester.pump(const Duration(milliseconds: 100));
-      }
-      expect(find.text('JUVR-316'), findsOneWidget);
+      expect(find.text('JUR-487'), findsNothing);
+      expect(find.text('JUVR-316'), findsNothing);
+      expect(find.byType(AvWorkCard), findsOneWidget);
     });
 
     testWidgets('详情页作品按卡片网格展示', (tester) async {

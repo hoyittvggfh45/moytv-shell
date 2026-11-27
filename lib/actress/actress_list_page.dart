@@ -22,12 +22,9 @@ import 'actress_sql_import.dart';
 import 'actress_sql_import_controller.dart';
 import 'actress_sql_import_section.dart';
 import 'actress_db_manage_page.dart';
-import 'actress_whos_topup.dart';
-import 'whos_json_index.dart';
 import 'actress_tag_sheet.dart';
 import '../models.dart';
 import '../whos_fallback.dart';
-import '../whos_local_library.dart';
 import '../core_bridge.dart';
 import '../local_store.dart';
 import '../player_picker.dart';
@@ -78,8 +75,6 @@ class ActressListPage extends StatefulWidget {
     this.fallback,
     this.showTitle = true,
     this.externalSearch,
-    this.topupPagerFuture,
-    this.topupIndexFuture,
   });
 
   final AppRepository repository;
@@ -101,14 +96,6 @@ class ActressListPage extends StatefulWidget {
   /// 测试/预览注入：JSON 兜底；不传时现建。
   @visibleForTesting
   final ActressJsonFallback? fallback;
-
-  /// 测试注入：无库顶上的目录分页器/女优索引；不传时走单例。
-  @visibleForTesting
-  final Future<WhosCatalogPager>? topupPagerFuture;
-
-  /// 测试注入：无库顶上的女优索引；不传时走单例。
-  @visibleForTesting
-  final Future<WhosJsonIndex>? topupIndexFuture;
 
   @override
   State<ActressListPage> createState() => _ActressListPageState();
@@ -538,35 +525,6 @@ class _ActressListPageState extends State<ActressListPage> {
   }
 
   void _cancelSqlImport() => _taskController.cancelSqlImport();
-
-  /// 顶上模式点作品播放：目录行 → 本地作品 → 一条直链集的详情，
-  /// 直接推播放器（who's 直链，不经站点解析、不查数据库）。
-  Future<void> _playTopupVideo(WhosVideo video) async {
-    final work = WhosLocalWork(
-      id: video.code,
-      title: video.title,
-      cover: video.pic,
-      playUrl: video.m3u8,
-      code: video.code,
-      brand: WhosLocalWork.brandOfCode(video.code),
-    );
-    final drama = whosLocalToDrama(work);
-    final detail = whosLocalDetail(drama, work);
-    if (!mounted) return;
-    if (detail.episodes.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('这条暂时没有可播地址')));
-      return;
-    }
-    await pushPlayer<void>(
-      context,
-      detail: detail,
-      initialIndex: 0,
-      repository: widget.repository,
-      store: widget.store,
-    );
-  }
 
   /// 打开数据库管理页（设置区与空态共用入口）。
   Future<void> _openDbManagePage() async {
@@ -1599,6 +1557,55 @@ class _ActressListPageState extends State<ActressListPage> {
     );
   }
 
+  /// 零导入空态（2026-11-27 用户令）：还没导入任何数据库时演员库
+  /// 不显示女优库也不显示磁力库，只给导入引导两个入口（导入 .sql /
+  /// 数据库管理）。导入成功后列表自动刷新切回数据库口径，本视图
+  /// 不再出现；删掉全部库后重新回到这里。
+  Widget _buildNoLibraryGuide(ColorScheme colors) {
+    return Center(
+      key: const ValueKey('actress-list-no-db-guide'),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.storage_rounded,
+              size: 44,
+              color: colors.onSurfaceVariant,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '还没有导入数据库',
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '演员库现在是空的。导入女优库的 .sql 后这里显示女优库；'
+              '导入磁力分类库的 .sql 后，它的分类会跟着出现。'
+              '在数据库管理里删掉哪个库，它的分类和作品就跟着消失。',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: colors.onSurfaceVariant),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              key: const ValueKey('actress-list-no-db-import'),
+              onPressed: () => unawaited(_startSqlImport()),
+              icon: const Icon(Icons.file_upload_outlined),
+              label: const Text('导入 .sql 数据库'),
+            ),
+            const SizedBox(height: 8),
+            TextButton(
+              key: const ValueKey('actress-list-no-db-manage'),
+              onPressed: () => unawaited(_openDbManagePage()),
+              child: const Text('数据库管理'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildList(ColorScheme colors) {
     // 只出作品的站源（nvku）：作品网格，点卡直发播放器。
     if (_siteWorksMode) return _buildSiteWorkList(colors);
@@ -1620,16 +1627,10 @@ class _ActressListPageState extends State<ActressListPage> {
           ? '该站暂无匹配人物'
           : '暂无人物';
       if (_noLibraryDb) {
-        // 没导过库：内置 who's 数据顶上首页（2026-11-25 用户令）：
-        // 作品流 + 按女优看，导入成功后自动刷新切回数据库口径
-        // （本分支不再命中）。目录读不出来时视图内部回落纯空态。
-        return ActressWhosTopupView(
-          onPlay: _playTopupVideo,
-          onImport: _startSqlImport,
-          onManage: _openDbManagePage,
-          pagerFuture: widget.topupPagerFuture,
-          indexFuture: widget.topupIndexFuture,
-        );
+        // 没导过任何库：只给空态/导入引导（2026-11-27 用户令，
+        // 取代 2026-11-25「内置 who's 数据顶上」）：不显示女优库、
+        // 不显示磁力库；导入哪个库才出现哪个，删库随之消失。
+        return _buildNoLibraryGuide(colors);
       }
       return Center(
         child: Text(

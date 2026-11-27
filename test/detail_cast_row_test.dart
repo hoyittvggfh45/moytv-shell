@@ -1,5 +1,7 @@
 // 详情页头区演员行 + 一集不画选集 + 自动写入开关隐藏（2026-11-24 用户令）。
-// PESS-012 真值：who's 映射里是佐々木あき；岸和水；420 码无此番号。
+// PESS-012 真值演员：佐々木あき、岸和水；420 码无此番号。演员来源
+// 2026-11-27 起改走已导入数据库（撤内置 who's 映射），测试用
+// dbCastLoader 注入模拟已导入库按番号查到的这两位。
 // 演员标签“佐佐木明希、岸和水”是蜘蛛 vod_actor 原样，头像行出现后
 // 标签行应把这一片藏掉（岸和水精确命中即整片去掉）。
 // 一测一张：调过 toImage 的测试在收尾时会挂起（旧预览测试同样如此，
@@ -11,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:moyi/actress/code_meta_section.dart';
 import 'package:moyi/detail_screen.dart';
 import 'package:moyi/local_store.dart';
 import 'package:moyi/models.dart';
@@ -43,6 +46,18 @@ class _PessRepository extends FixtureRepository {
   }
 }
 
+/// 模拟已导入女优库按番号查演员：PESS-012 的两位真值演员。
+Future<DbCodeCast> _fakeDbCast(String code) async {
+  if (code != 'PESS-012') return emptyDbCodeCast;
+  return (
+    female: <({String name, String avatarUrl})>[
+      (name: '佐々木あき', avatarUrl: ''),
+      (name: '岸和水', avatarUrl: ''),
+    ],
+    male: <({String name, String avatarUrl})>[],
+  );
+}
+
 ThemeData _theme() {
   final base = ThemeData.dark();
   return base.copyWith(
@@ -66,10 +81,11 @@ Future<void> _pumpPessDetail(WidgetTester tester) async {
         drama: _PessRepository.pess,
         repository: repository,
         store: store,
+        dbCastLoader: _fakeDbCast,
       ),
     ),
   );
-  // 索引加载（26MB gz 解压 + 建索引约 3–5 秒）要放行真实异步。
+  // 演员行解析（420 码资源 + 数据库演员查询）要放行真实异步。
   await tester.runAsync(() async {
     await Future<void>.delayed(const Duration(seconds: 6));
   });
@@ -140,6 +156,7 @@ void main() {
             drama: _PessRepository.pess,
             repository: repository,
             store: store,
+            dbCastLoader: _fakeDbCast,
           ),
         ),
       ),

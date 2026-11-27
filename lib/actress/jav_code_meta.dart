@@ -21,7 +21,6 @@ import 'package:flutter/services.dart';
 
 import '../crosssite_probe.dart';
 import 'actress_models.dart';
-import 'whos_json_index.dart';
 
 /// 一条番号的三站元数据（已去重、已归一；缺失字段为空，不编值）。
 class CodeMeta {
@@ -36,7 +35,7 @@ class CodeMeta {
     required this.male,
     this.femaleAvatars = const [],
     this.maleAvatars = const [],
-    this.fromWhos = false,
+    this.fromDb = false,
   });
 
   /// 番号标准写法：全大写 + 横杠，后缀保留（如 EBWH-035-UNCENSORED-LEAK
@@ -72,9 +71,10 @@ class CodeMeta {
   /// 男优头像地址，与 [male] 按下标一一对应；没有头像时该位为空。
   final List<String> maleAvatars;
 
-  /// 演员是否来自 who's.json 内置索引（true 时导演仍只来自 420 码，
-  /// 演员是 json 索引与 420 码合并后的结果；仅内部用，不显示番号）。
-  final bool fromWhos;
+  /// 演员是否来自已导入的女优库数据库（2026-11-27 撤内置 who's
+  /// 索引后改走数据库：true 时导演仍只来自 420 码，演员是数据库
+  /// 与 420 码合并后的结果；仅内部用，不显示番号）。
+  final bool fromDb;
 
   /// 全部演员：女优在前、男优在后。
   List<String> get cast => [...female, ...male];
@@ -235,52 +235,55 @@ class JavCodeMeta {
   /// 详情页匹配入口：先番号、再标题兜底；都查不到返回 null。
   /// [id] 是详情页 drama.id（如 `json:chaoliu:rki-6042`、
   /// `code_RKI-6042`），[title] 是详情页标题。
-  /// [whosIndex] 传了时，演员先从 who's.json 内置索引查（339,526 码），
-  /// 再与 420 码的演员合并去重（json 在前）；导演仍只来自 420 码。
-  /// json 索引里没有头像，头像只从 420 码里按名字对（对不上留空回落首字）。
+  /// [dbFemale]/[dbMale] 是已导入女优库按番号查到的演员（调用方
+  /// 查库，见 code_meta_section 的 dbCastForCode；没导入/查不到传
+  /// 空）：演员先取数据库、再与 420 码合并去重（库在前，头像优先
+  /// 用库里的）；导演仍只来自 420 码。
   CodeMeta? match({
     required String id,
     required String title,
     String sourceId = '',
-    WhosJsonIndex? whosIndex,
+    List<({String name, String avatarUrl})> dbFemale = const [],
+    List<({String name, String avatarUrl})> dbMale = const [],
   }) {
     final code = resolveCode(id: id, title: title, sourceId: sourceId);
     if (code.isNotEmpty) {
       final byCode = metaForCode(code);
-      final whosCast = whosIndex?.castForCode(code) ?? const <String>[];
-      final whosVideo = whosIndex?.videoForCode(code);
-      if (byCode != null || whosCast.isNotEmpty) {
-        return _mergeWithWhos(
+      if (byCode != null || dbFemale.isNotEmpty || dbMale.isNotEmpty) {
+        return _mergeWithDbCast(
           code: code,
           base: byCode,
-          whosCast: whosCast,
-          whosTitle: whosVideo?.title ?? '',
+          dbFemale: dbFemale,
+          dbMale: dbMale,
         );
       }
     }
     return metaForTitle(title);
   }
 
-  /// 把 420 码元数据与 who's 索引的演员合并成一条 CodeMeta。
-  /// 演员：json 在前、420 码在后，去重；导演/厂商/年份/标题只取 420 码，
-  /// 420 码没有时标题取 json 视频标题（其余留空）。
-  CodeMeta _mergeWithWhos({
+  /// 把 420 码元数据与数据库演员合并成一条 CodeMeta。
+  /// 演员：数据库在前、420 码在后，去重；头像优先数据库的，
+  /// 库里没有再从 420 码按名字对（对不上留空回落首字）。
+  /// 导演/厂商/年份/标题只取 420 码（数据库演员行不带这些）。
+  CodeMeta _mergeWithDbCast({
     required String code,
     required CodeMeta? base,
-    required List<String> whosCast,
-    required String whosTitle,
+    required List<({String name, String avatarUrl})> dbFemale,
+    required List<({String name, String avatarUrl})> dbMale,
   }) {
     final female = <String>[];
     final femaleAvatars = <String>[];
     final seen = <String>{};
-    // json 演员在前（whos 映射只有女优）。
-    for (final name in whosCast) {
-      if (seen.add(name)) {
-        female.add(name);
-        femaleAvatars.add(_avatarFor(name, base));
+    for (final entry in dbFemale) {
+      if (seen.add(entry.name)) {
+        female.add(entry.name);
+        femaleAvatars.add(
+          entry.avatarUrl.isNotEmpty
+              ? entry.avatarUrl
+              : _avatarFor(entry.name, base),
+        );
       }
     }
-    // 420 码女优在后，去重。
     for (var i = 0; i < (base?.female.length ?? 0); i++) {
       final name = base!.female[i];
       if (seen.add(name)) {
@@ -290,18 +293,36 @@ class JavCodeMeta {
         );
       }
     }
+    final male = <String>[];
+    final maleAvatars = <String>[];
+    final seenMale = <String>{};
+    for (final entry in dbMale) {
+      if (seenMale.add(entry.name)) {
+        male.add(entry.name);
+        maleAvatars.add(entry.avatarUrl);
+      }
+    }
+    for (var i = 0; i < (base?.male.length ?? 0); i++) {
+      final name = base!.male[i];
+      if (seenMale.add(name)) {
+        male.add(name);
+        maleAvatars.add(
+          i < base.maleAvatars.length ? base.maleAvatars[i] : '',
+        );
+      }
+    }
     return CodeMeta(
       code: code,
-      title: (base?.title ?? '').isNotEmpty ? base!.title : whosTitle,
+      title: base?.title ?? '',
       titleAlts: base?.titleAlts ?? const [],
       year: base?.year,
       director: base?.director ?? '',
       maker: base?.maker ?? '',
       female: female,
-      male: base?.male ?? const [],
+      male: male,
       femaleAvatars: femaleAvatars,
-      maleAvatars: base?.maleAvatars ?? const [],
-      fromWhos: whosCast.isNotEmpty,
+      maleAvatars: maleAvatars,
+      fromDb: dbFemale.isNotEmpty || dbMale.isNotEmpty,
     );
   }
 

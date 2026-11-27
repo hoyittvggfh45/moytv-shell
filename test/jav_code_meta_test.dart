@@ -7,7 +7,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:moyi/actress/code_meta_section.dart';
 import 'package:moyi/actress/jav_code_meta.dart';
-import 'package:moyi/actress/whos_json_index.dart';
+
+/// 没导入数据库时的演员查询注入（恒空）。
+Future<DbCodeCast> _emptyDbCast(String code) async => emptyDbCodeCast;
 
 void main() {
   group('JavCodeMeta 解析（紧凑行格式）', () {
@@ -148,53 +150,42 @@ void main() {
       expect(row.title, isNotEmpty);
     });
 
-    test('match + who\'s 索引：演员合并（json 在前、420 在后去重），导演只取 420', () {
+    test('match + 数据库演员：合并（库在前、420 在后去重），导演只取 420', () {
       final map = JavCodeMeta.fromLines(lines);
-      final whos = WhosJsonIndex.fromLines(
-        catalogLines: const [
-          'ABP-188||json 标题||https://v.hersav.me/images/av/a.jpg||https://v.hersav.me/a/a.m3u8',
-          'ROE-566||json 标题二||https://v.hersav.me/images/av/b.jpg||https://v.hersav.me/b/b.m3u8',
-        ],
-        mapLines: const [
-          // ABP-188：json 给星冬香，420 码给あやみ旬果——合并后两个都在，json 在前。
-          'ABP-188||星冬香',
-          // ROE-566：420 码里没有，json 单独给演员。
-          'ROE-566||星冬香',
-        ],
-      );
-      // ABP-188：演员合并，导演仍是 420 码的，fromWhos 为真。
+      // 2026-11-27 撤内置 who's 索引后，演员改由调用方查已导入
+      // 数据库后以 dbFemale/dbMale 传入（原 whosIndex 入参的等价物）。
+      const dbCastAbp = [
+        (name: '星冬香', avatarUrl: 'https://img.test/x.jpg'),
+      ];
+      // ABP-188：库给星冬香，420 码给あやみ旬果——合并后两个都在，库在前。
       final abp = map.match(
         id: 'json:chaoliu:abp-188',
         title: '别的标题',
-        whosIndex: whos,
+        dbFemale: dbCastAbp,
       );
       expect(abp, isNotNull);
       expect(abp!.female, ['星冬香', 'あやみ旬果']);
+      expect(abp.femaleAvatars.first, 'https://img.test/x.jpg');
       expect(abp.director, isNotEmpty);
-      expect(abp.fromWhos, isTrue);
-      // ROE-566：420 码里没有，json 单独给演员，导演为空，标题取 json 的。
+      expect(abp.fromDb, isTrue);
+      // ROE-566：420 码里没有，库单独给演员，导演为空。
       final roe = map.match(
         id: 'json:whos:roe-566',
         title: '别的标题',
-        whosIndex: whos,
+        dbFemale: dbCastAbp,
       );
       expect(roe, isNotNull);
       expect(roe!.female, ['星冬香']);
       expect(roe.director, isEmpty);
-      expect(roe.title, 'json 标题二');
-      expect(roe.fromWhos, isTrue);
-      // 都查不到返回 null（json 里没有、420 码里也没有）。
+      expect(roe.fromDb, isTrue);
+      // 都查不到返回 null（库里没有、420 码里也没有）。
       expect(
-        map.match(
-          id: 'json:chaoliu:not-exist-001',
-          title: '不存在的标题',
-          whosIndex: whos,
-        ),
+        map.match(id: 'json:chaoliu:not-exist-001', title: '不存在的标题'),
         isNull,
       );
-      // 不传 whosIndex 时行为不变（只查 420 码）。
-      final noWhos = map.match(id: 'json:whos:roe-566', title: '别的标题');
-      expect(noWhos, isNull);
+      // 不传库演员时行为不变（只查 420 码）。
+      final noDb = map.match(id: 'json:whos:roe-566', title: '别的标题');
+      expect(noDb, isNull);
     });
 
     test('头像字段：第 9、10 字段与名字一一对应，缺位为空', () {
@@ -307,6 +298,8 @@ void main() {
             body: CodeMetaSection(
               dramaId: 'json:chaoliu:abp-188',
               title: 'ABP-188 美しいお嬢様の卑猥なる飼育 あやみ旬果',
+              // 没导入数据库的等价注入（真 File IO 在假异步区不返回）。
+              dbCastLoader: _emptyDbCast,
             ),
           ),
         ),
@@ -333,6 +326,7 @@ void main() {
             body: CodeMetaSection(
               dramaId: 'json:chaoliu:cnth-302',
               title: '走馬探花到世界各地约炮3P',
+              dbCastLoader: _emptyDbCast,
             ),
           ),
         ),
@@ -348,6 +342,51 @@ void main() {
             body: CodeMetaSection(
               dramaId: 'some-spider-id-12345',
               title: '一部不存在的片名',
+              dbCastLoader: _emptyDbCast,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('演员与导演'), findsNothing);
+    });
+
+    testWidgets('演员改走已导入数据库：库里有、420 没有也显示，来源标女优库', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: CodeMetaSection(
+              dramaId: 'json:whos:roe-566',
+              title: '别的标题',
+              // 模拟已导入数据库按番号查到的演员（420 码里没有 ROE-566）。
+              dbCastLoader: (_) async => (
+                female: <({String name, String avatarUrl})>[
+                  (name: '星冬香', avatarUrl: ''),
+                ],
+                male: <({String name, String avatarUrl})>[],
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+      expect(find.text('演员与导演'), findsOneWidget);
+      expect(find.text('星冬香'), findsOneWidget);
+      expect(find.text('女优库'), findsOneWidget);
+    });
+
+    testWidgets('没导入数据库（库演员为空）且 420 也没有：整区不显示', (
+      tester,
+    ) async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: CodeMetaSection(
+              dramaId: 'json:whos:roe-566',
+              title: '别的标题',
+              dbCastLoader: (_) async => emptyDbCodeCast,
             ),
           ),
         ),

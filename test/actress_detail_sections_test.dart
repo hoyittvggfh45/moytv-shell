@@ -1,11 +1,14 @@
 // 详情页信息卡 + 演员卡片排 + 剧照区（2026-11-26 照 AvPlay
 // 详情页截图补）：
 // - 信息卡只列真有字段（番号/发行日期/长度/制作商），评分不出现；
-// - 演员区是照片卡（键 cast-<名字>），PESS-012 真值演员出现；
+// - 演员区是照片卡（键 cast-<名字>），PESS-012 演员出现——演员
+//   来源 2026-11-27 起改走已导入数据库（撤内置 who's 索引），
+//   测试用 dbCastLoader 注入模拟已导入库的查询结果；
 // - 剧照区带「全部 N >」，stills 为空时整区不显示；
 // - 普通作品（无番号/无附加信息/无剧照）不显示信息卡与剧照区。
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:moyi/actress/code_meta_section.dart';
 import 'package:moyi/detail_screen.dart';
 import 'package:moyi/local_store.dart';
 import 'package:moyi/models.dart';
@@ -29,6 +32,18 @@ const _drama = Drama(
   episodes: 1,
 );
 
+/// 模拟已导入女优库按番号查演员：PESS-012 的两位真值演员。
+Future<DbCodeCast> _fakeDbCast(String code) async {
+  if (code != 'PESS-012') return emptyDbCodeCast;
+  return (
+    female: <({String name, String avatarUrl})>[
+      (name: '岸和水', avatarUrl: ''),
+      (name: '佐々木あき', avatarUrl: ''),
+    ],
+    male: <({String name, String avatarUrl})>[],
+  );
+}
+
 Future<void> _pumpDetail(
   WidgetTester tester, {
   required Drama drama,
@@ -48,6 +63,7 @@ Future<void> _pumpDetail(
         repository: _EmptyDetailRepository(),
         store: store,
         initialDetail: initialDetail,
+        dbCastLoader: _fakeDbCast,
       ),
     ),
   );
@@ -140,8 +156,8 @@ void main() {
     // 评分没有真数据：整页不许出现评分行/评分字样。
     expect(find.textContaining('评分'), findsNothing);
 
-    // 演员卡片排：PESS-012 真值两位演员各一张卡（番号元数据
-    // 索引真异步加载，轮询等卡出现）。
+    // 演员卡片排：PESS-012 真值两位演员各一张卡（演员来自
+    // 已导入数据库的注入查询，真异步加载，轮询等卡出现）。
     for (var i = 0; i < 40; i++) {
       if (find
           .byKey(const ValueKey('cast-岸和水'))

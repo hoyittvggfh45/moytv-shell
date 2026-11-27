@@ -12,8 +12,6 @@ import 'package:moyi/actress/actress_json_fallback.dart';
 import 'package:moyi/actress/actress_list_page.dart';
 import 'package:moyi/actress/actress_m3u_index.dart';
 import 'package:moyi/actress/actress_mytv_bind.dart';
-import 'package:moyi/actress/actress_whos_topup.dart';
-import 'package:moyi/actress/whos_json_index.dart';
 import 'package:moyi/local_store.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -258,18 +256,9 @@ void main() {
       addTearDown(() => temp.deleteSync(recursive: true));
     });
 
-    testWidgets('没导入数据库：内置数据顶上，不自动同步', (tester) async {
+    testWidgets('没导入数据库：只给空态导入引导，不顶数、不自动同步', (tester) async {
       final store = await _makeStore();
       final fallback = ActressJsonFallback(documentsDir: temp);
-      // 无库顶上（2026-11-25 晚用户令）：注入小目录/索引夹具，
-      // 不读真 33.9 万行资产（与 actress_whos_topup_test 同款）。
-      const catalogText =
-          'SSIS-001||第一部标题||https://img.test/1.jpg||https://v.test/1.m3u8\n';
-      final topupPager = WhosCatalogPager.fromText(catalogText);
-      final topupIndex = WhosJsonIndex.fromLines(
-        catalogLines: catalogText.split('\n'),
-        mapLines: const ['SSIS-001||女优甲'],
-      );
       // 2026-11-20：列表页 bootstrap 里 await 平台通道拿 MYTV
       // 绑定（真机上毫秒级）。pumpAndSettle 的假时钟等不到真异步
       // bootstrap（会超时），pump() 也不能放进 runAsync（会挂住）：
@@ -282,8 +271,6 @@ void main() {
               store: store,
               database: _NoLibraryTestDb(),
               fallback: fallback,
-              topupPagerFuture: Future.value(topupPager),
-              topupIndexFuture: Future.value(topupIndex),
             ),
           ),
         );
@@ -294,20 +281,26 @@ void main() {
         );
         await tester.pump(const Duration(milliseconds: 100));
       }
-      // 空库不再自动生成（2026-11-22 用户令最终口径）：不灌
-      // 内置 json 种子、不联网拉数据（同步功能已于 2026-11-25 删除）。
-      // 2026-11-25 晚新口径（用户令「顶上」）：没导过库时内置
-      // who's 目录顶上首页，旧纯空态文案只在内置目录读不出来时
-      // 才回落出现；绑定行与“重新加载数据库”入口都删了。
+      // 2026-11-27 用户令（取代 2026-11-25「内置 who's 数据顶上」）：
+      // 零导入时演员库不显示女优库也不显示磁力库，只给空态/导入
+      // 引导；不灌内置数据、不联网拉数据（同步功能已于
+      // 2026-11-25 删除）；绑定行与“重新加载数据库”入口都没有。
       expect(
-        find.text('还没导入数据库，先用内置数据顶上（导入后自动换成数据库）'),
+        find.byKey(const ValueKey('actress-list-no-db-guide')),
+        findsOneWidget,
+      );
+      expect(find.text('还没有导入数据库'), findsOneWidget);
+      expect(
+        find.byKey(const ValueKey('actress-list-no-db-import')),
         findsOneWidget,
       );
       expect(
-        find.text('还没有导入数据库：请在设置里导入 .sql 数据库'),
-        findsNothing,
+        find.byKey(const ValueKey('actress-list-no-db-manage')),
+        findsOneWidget,
       );
       expect(find.text('重新加载数据库'), findsNothing);
+      // 顶上时代的作品流/人物不许再出现。
+      expect(find.byKey(const ValueKey('actress-person-list')), findsNothing);
     });
   });
 }

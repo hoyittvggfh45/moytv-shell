@@ -92,6 +92,7 @@ class DetailScreen extends StatefulWidget {
     this.videoBuilder,
     this.javdbStillsClient,
     this.pan115Gateway,
+    this.dbCastLoader,
   });
   final Drama drama;
   final AppRepository repository;
@@ -141,6 +142,10 @@ class DetailScreen extends StatefulWidget {
   /// 引擎既有 115 登录；不传时 115 区不出现，其余行为不变。
   /// 只供演员库链与测试注入。
   final Pan115Gateway? pan115Gateway;
+
+  /// 测试注入：详情页演员行的数据库演员查询（按番号查已导入
+  /// 女优库）；不传走 code_meta_section 的 dbCastForCode 真库。
+  final Future<DbCodeCast> Function(String code)? dbCastLoader;
   @override
   State<DetailScreen> createState() => _DetailScreenState();
 }
@@ -169,7 +174,7 @@ class _DetailScreenState extends State<DetailScreen> {
   TmdbMetadata? _tmdb;
 
   /// 头区演员行匹配结果（番号 → 演员与导演）：详情加载后按番号查
-  /// 三站元数据 + who's 索引（与 CodeMetaSection 同一份匹配）。
+  /// 三站元数据 + 已导入数据库演员（与 CodeMetaSection 同一份匹配）。
   /// null = 未匹配到或尚未查完，头区不画演员行。
   CodeMeta? _codeMeta;
 
@@ -300,7 +305,7 @@ class _DetailScreenState extends State<DetailScreen> {
     }
   }
 
-  /// 头区演员行：按番号查三站元数据 + who's 索引（与 CodeMetaSection
+  /// 头区演员行：按番号查三站元数据 + 已导入数据库演员（与 CodeMetaSection
   /// 同一份匹配，见 code_meta_section.dart）。代次守卫：刷新后旧
   /// 结果不再写回。查不到时 _codeMeta 为 null，头区不画演员行、
   /// 标签照常显示。
@@ -309,6 +314,7 @@ class _DetailScreenState extends State<DetailScreen> {
       dramaId: drama.id,
       title: drama.title,
       sourceId: drama.sourceId,
+      dbCastLoader: widget.dbCastLoader,
     );
     if (!mounted || generation != _generation) return;
     // 本地元数据没查到时不要把 JavDB 补充链（_loadJavdbExtras）
