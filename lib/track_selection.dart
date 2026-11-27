@@ -162,7 +162,13 @@ class TrackChoice {
   }
 }
 
-enum TrackMenuEntryKind { audio, subtitleEmbedded, subtitleExternal, subtitleOff }
+enum TrackMenuEntryKind {
+  audio,
+  video,
+  subtitleEmbedded,
+  subtitleExternal,
+  subtitleOff,
+}
 
 /// 菜单里的一条轨道选项。
 class TrackMenuEntry {
@@ -196,6 +202,20 @@ List<TrackMenuEntry> buildAudioTrackEntries(
       kind: TrackMenuEntryKind.audio,
       id: tracks[i].id,
       label: tracks[i].label('音轨', i),
+      selected: tracks[i].id == selectedId,
+    ),
+];
+
+/// 视轨菜单条目：与音轨同法，按播放器给的顺序列出、标当前选中。
+List<TrackMenuEntry> buildVideoTrackEntries(
+  List<TrackChoice> tracks, {
+  String selectedId = '',
+}) => [
+  for (var i = 0; i < tracks.length; i++)
+    TrackMenuEntry(
+      kind: TrackMenuEntryKind.video,
+      id: tracks[i].id,
+      label: tracks[i].label('视轨', i),
       selected: tracks[i].id == selectedId,
     ),
 ];

@@ -51,7 +51,9 @@ void main() {
     await pumpZone(tester, HomeZone.live);
     expect(find.text('直播设置'), findsOneWidget);
     expect(find.text('直播源'), findsOneWidget);
-    expect(find.text('播放设置'), findsOneWidget);
+    // 播放设置已随偏好迁入播放器内嵌菜单（2026-11-27），本页摘除；
+    // 播放器选择（双播放器切换）保留。
+    expect(find.text('播放设置'), findsNothing);
     expect(find.text('播放器选择'), findsOneWidget);
     expect(find.text('通用设置'), findsOneWidget);
     expect(find.text('短剧区风格'), findsNothing);

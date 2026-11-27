@@ -8,6 +8,7 @@ import 'network_speed.dart';
 import 'playback_preferences.dart';
 import 'player_core.dart';
 import 'player_interactions.dart';
+import 'player_overlay_settings.dart';
 import 'widgets.dart';
 import 'video_enhancement.dart';
 
@@ -56,6 +57,10 @@ class PlayerControls extends StatefulWidget {
     this.onCoreTap,
     this.showTopBarBackButton = true,
     this.onControlsVisibilityChanged,
+    this.coreOptions,
+    this.onCoreSelected,
+    this.onCast,
+    this.overlaySettings = const OverlayDisplaySettings(),
   });
 
   final Player player;
@@ -99,6 +104,18 @@ class PlayerControls extends StatefulWidget {
   final PlayerCore? core;
   final VoidCallback? onCoreTap;
 
+  /// 顶栏内核下拉（T5）：给了选项与回调时，徽章变下拉浮层
+  /// （选中项打勾），不再走 onCoreTap 的居中弹窗。
+  final List<PlayerCoreOption>? coreOptions;
+  final ValueChanged<PlayerCore>? onCoreSelected;
+
+  /// 投屏入口（T7）：为空时顶栏不显示投屏钮。
+  final VoidCallback? onCast;
+
+  /// 屏显设置（M10/M11）：标题/网速/时钟显隐、屏显字号、
+  /// 底部进度条常驻策略。
+  final OverlayDisplaySettings overlaySettings;
+
   /// 顶栏是否画返回箭头。宿主在同一角落另有常驻返回时传 false，
   /// 顶栏只留同尺寸占位，避免两个箭头重叠（两者行为相同）。
   final bool showTopBarBackButton;
@@ -114,6 +131,7 @@ class PlayerControls extends StatefulWidget {
 class _PlayerControlsState extends State<PlayerControls> {
   final List<StreamSubscription<dynamic>> _subscriptions = [];
   Timer? _hideTimer;
+  String _clockText = '';
   bool _progressDragging = false;
   bool _visible = true;
   bool _suppressAutoPlaybackStart = false;
@@ -155,9 +173,21 @@ class _PlayerControlsState extends State<PlayerControls> {
         setState(() {});
       }),
     );
+    // 分辨率上屏（T4）：视频参数变化时重建顶栏信息行。
+    _subscriptions.add(
+      widget.player.stream.videoParams.listen((_) {
+        if (!mounted) return;
+        setState(() {});
+      }),
+    );
+    // 时钟不挂周期定时器（会让测试的 pumpAndSettle 永不静止，
+    // 真机上也白耗电）：挂载时取一次，其后随播放/缓冲状态变化
+    // 与父级重建时顺带刷新，分钟级精度足够。
+    _updateClock();
     _subscriptions.add(
       widget.player.stream.buffering.distinct().listen((_) {
         if (!mounted) return;
+        _clockText = _clockNowText();
         setState(() {});
         _scheduleHide();
       }),
@@ -194,6 +224,9 @@ class _PlayerControlsState extends State<PlayerControls> {
   @override
   void didUpdateWidget(PlayerControls oldWidget) {
     super.didUpdateWidget(oldWidget);
+    // 父级重建时顺带刷新时钟文本（不另起 setState，本次 build
+    // 就会带上新值）。
+    _clockText = _clockNowText();
     if (widget.enabled != oldWidget.enabled ||
         widget.panelOpen != oldWidget.panelOpen ||
         widget.fullscreen != oldWidget.fullscreen ||
@@ -224,6 +257,16 @@ class _PlayerControlsState extends State<PlayerControls> {
       _scheduleHide();
       _scheduleVisibilityNotify();
     }
+  }
+
+  String _clockNowText() {
+    final now = DateTime.now();
+    return '${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}';
+  }
+
+  void _updateClock() {
+    final text = _clockNowText();
+    if (text != _clockText) setState(() => _clockText = text);
   }
 
   void _interactionChanged() {
@@ -297,6 +340,7 @@ class _PlayerControlsState extends State<PlayerControls> {
 
   @override
   void dispose() {
+    _hideTimer?.cancel();
     _hideTimer?.cancel();
     widget.interactions.removeListener(_interactionChanged);
     for (final subscription in _subscriptions) {
@@ -394,6 +438,33 @@ class _PlayerControlsState extends State<PlayerControls> {
               ),
             ),
           ),
+          // M11「始终展示」：控制层隐藏时底部进度条单独常驻
+          // （可拖动），不随控制层淡出。
+          if (!_controlsVisible &&
+              widget.enabled &&
+              widget.overlaySettings.showProgress &&
+              widget.overlaySettings.progressVisibility ==
+                  ProgressVisibility.always)
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: _bottomChromeInset(),
+              child: _ProgressRow(
+                player: widget.player,
+                enabled: widget.enabled,
+                active: true,
+                onSeek: widget.onSeek ?? widget.player.seek,
+                onDragStart: () {
+                  _progressDragging = true;
+                  widget.interactions.cancel();
+                  _hideTimer?.cancel();
+                },
+                onDragEnd: () {
+                  _progressDragging = false;
+                  _show();
+                },
+              ),
+            ),
           _gestureFeedback(),
           _boostBadge(),
         ],
@@ -416,11 +487,25 @@ class _PlayerControlsState extends State<PlayerControls> {
 
   Widget _topBar() {
     final compact = widget.swipeEnabled && !widget.fullscreen;
+    final overlay = widget.overlaySettings;
     return Align(
       alignment: Alignment.topCenter,
       child: Padding(
         padding: EdgeInsets.only(top: compact ? 8 : 0),
-        child: Row(
+        child: LayoutBuilder(
+          builder: (context, constraints) =>
+              _topBarRow(compact, overlay, constraints.maxWidth),
+        ),
+      ),
+    );
+  }
+
+  Widget _topBarRow(bool compact, OverlayDisplaySettings overlay, double barWidth) {
+    // 窄屏（竖屏手机）顶栏塞不下时钟：<430 时藏时钟，保标题与
+    // 内核下拉不被挤溢出（曾溢出 8px 打挂布局断言）。
+    final showClock = overlay.showClock && barWidth >= 430;
+    return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (widget.showTopBarBackButton)
               _overlayIconButton(
@@ -438,19 +523,55 @@ class _PlayerControlsState extends State<PlayerControls> {
               const SizedBox(width: 46, height: 42),
             if (!compact)
               Expanded(
-                child: Text(
-                  widget.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Colors.white),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (overlay.showTitle)
+                      Text(
+                        widget.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                        ),
+                      ),
+                    _infoLine(compact: false),
+                  ],
                 ),
               )
             else
               const Spacer(),
-            if (widget.core != null && widget.onCoreTap != null)
+            if (widget.core != null &&
+                widget.onCoreSelected != null &&
+                widget.coreOptions != null)
+              _coreDropdown()
+            else if (widget.core != null && widget.onCoreTap != null)
               PlayerCoreBadge(core: widget.core!, onTap: widget.onCoreTap!),
-            if (widget.networkSpeed != null)
+            if (compact && widget.networkSpeed != null && overlay.showSpeed)
               networkSpeedLabel(widget.networkSpeed!),
+            if (showClock)
+              Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 3,
+                  vertical: 10,
+                ),
+                child: Text(
+                  _clockText,
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: overlay.fontSize.toDouble(),
+                    fontFeatures: const [FontFeature.tabularFigures()],
+                  ),
+                ),
+              ),
+            if (widget.onCast != null)
+              _overlayIconButton(
+                tooltip: '投屏',
+                onPressed: widget.onCast,
+                icon: Icons.cast_rounded,
+              ),
             if (widget.onOrientationMode != null) _orientationMenu(),
             if (compact)
               _overlayIconButton(
@@ -459,6 +580,128 @@ class _PlayerControlsState extends State<PlayerControls> {
                 icon: Icons.screen_rotation_alt_rounded,
               ),
           ],
+    );
+  }
+
+  /// T4 信息行：分辨率（WxH）＋实时网速，13sp，标题正下方。
+  /// 分辨率取不到（未出画/非 MPV 路径无尺寸）时只显示网速，
+  /// 两样都没有时整行不占位。
+  Widget _infoLine({required bool compact}) {
+    final state = widget.player.state;
+    final resolution =
+        (state.width ?? 0) > 0 && (state.height ?? 0) > 0
+        ? '${state.width}x${state.height}'
+        : '';
+    final showSpeed = widget.overlaySettings.showSpeed &&
+        widget.networkSpeed != null;
+    if (resolution.isEmpty && !showSpeed) return const SizedBox.shrink();
+    return Padding(
+      padding: const EdgeInsets.only(top: 2),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (resolution.isNotEmpty)
+            Text(
+              resolution,
+              style: const TextStyle(color: Colors.white70, fontSize: 13),
+            ),
+          if (resolution.isNotEmpty && showSpeed) const SizedBox(width: 10),
+          if (showSpeed)
+            ValueListenableBuilder<String?>(
+              valueListenable: widget.networkSpeed!,
+              builder: (_, value, _) => Text(
+                value ?? '',
+                style: const TextStyle(color: Colors.white70, fontSize: 13),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// T5 内核下拉：胶囊徽章点开浮层，当前核绿色＋✓（对齐参考
+  /// 形态），不可用核置灰带原因。
+  Widget _coreDropdown() {
+    final core = widget.core!;
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 3),
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: Colors.black.withValues(alpha: .45),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: Colors.white.withValues(alpha: .25)),
+        ),
+        child: PopupMenuButton<PlayerCore>(
+          key: const ValueKey('player-core-dropdown'),
+          tooltip: '切换播放器内核',
+          enabled: widget.enabled,
+          onSelected: widget.onCoreSelected,
+          itemBuilder: (_) => [
+            for (final option in widget.coreOptions!)
+              PopupMenuItem<PlayerCore>(
+                value: option.core,
+                enabled: option.enabled,
+                height: 44,
+                child: Row(
+                  children: [
+                    Icon(
+                      Icons.play_arrow_rounded,
+                      size: 16,
+                      color: option.core == core
+                          ? const Color(0xFF55B16C)
+                          : Colors.white54,
+                    ),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        option.enabled
+                            ? option.core.label
+                            : '${option.core.label}（${option.disabledNote ?? '不可用'}）',
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: option.core == core
+                              ? const Color(0xFF55B16C)
+                              : null,
+                        ),
+                      ),
+                    ),
+                    if (option.core == core)
+                      const Icon(
+                        Icons.check_rounded,
+                        size: 18,
+                        color: Color(0xFF55B16C),
+                      ),
+                  ],
+                ),
+              ),
+          ],
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(
+                  Icons.play_arrow_rounded,
+                  size: 14,
+                  color: Colors.white,
+                ),
+                const SizedBox(width: 2),
+                Text(
+                  core.label,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const Icon(
+                  Icons.arrow_drop_down_rounded,
+                  size: 16,
+                  color: Colors.white70,
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
@@ -593,21 +836,22 @@ class _PlayerControlsState extends State<PlayerControls> {
               showVolume: showVolume,
               volume: volume,
             ),
-          _ProgressRow(
-            player: widget.player,
-            enabled: widget.enabled,
-            active: _controlsVisible,
-            onSeek: widget.onSeek ?? widget.player.seek,
-            onDragStart: () {
-              _progressDragging = true;
-              widget.interactions.cancel();
-              _hideTimer?.cancel();
-            },
-            onDragEnd: () {
-              _progressDragging = false;
-              _show();
-            },
-          ),
+          if (widget.overlaySettings.showProgress)
+            _ProgressRow(
+              player: widget.player,
+              enabled: widget.enabled,
+              active: _controlsVisible,
+              onSeek: widget.onSeek ?? widget.player.seek,
+              onDragStart: () {
+                _progressDragging = true;
+                widget.interactions.cancel();
+                _hideTimer?.cancel();
+              },
+              onDragEnd: () {
+                _progressDragging = false;
+                _show();
+              },
+            ),
         ],
       ),
     );
@@ -652,11 +896,13 @@ class _PlayerControlsState extends State<PlayerControls> {
     required String label,
     required VoidCallback? onPressed,
     double width = 52,
+    double fontSize = 12,
   }) => _toolButton(
     key: key,
     tooltip: tooltip,
     onPressed: onPressed,
     visualWidth: width,
+    fontSize: fontSize,
     child: Text(
       label,
       maxLines: 1,
@@ -672,6 +918,7 @@ class _PlayerControlsState extends State<PlayerControls> {
     required VoidCallback? onPressed,
     bool selected = false,
     double visualWidth = 36,
+    double fontSize = 12,
   }) {
     final scheme = Theme.of(context).colorScheme;
     final enabled = onPressed != null;
@@ -714,7 +961,7 @@ class _PlayerControlsState extends State<PlayerControls> {
                   child: DefaultTextStyle.merge(
                     style: TextStyle(
                       color: foreground,
-                      fontSize: 12,
+                      fontSize: fontSize,
                       height: 1,
                       fontWeight: FontWeight.w700,
                     ),
@@ -803,6 +1050,7 @@ class _PlayerControlsState extends State<PlayerControls> {
           label: '${widget.speed}x',
           onPressed: widget.enabled ? () => _panel(widget.onSpeed) : null,
           width: 50,
+          fontSize: 13,
         ),
         _toolText(
           key: const ValueKey('player-quality'),
@@ -823,8 +1071,8 @@ class _PlayerControlsState extends State<PlayerControls> {
       if (widget.onSettings != null)
         _toolIcon(
           key: const ValueKey('player-settings'),
-          tooltip: '播放设置',
-          icon: Icons.tune_rounded,
+          tooltip: '更多',
+          icon: Icons.more_vert_rounded,
           onPressed: widget.enabled ? () => _panel(widget.onSettings!) : null,
         ),
       if (showCompare) _enhancementCompareButton(),
@@ -881,6 +1129,7 @@ class _PlayerControlsState extends State<PlayerControls> {
         label: '${widget.speed}x',
         onPressed: widget.enabled ? () => _panel(widget.onSpeed) : null,
         width: 50,
+        fontSize: 13,
       ),
       _toolText(
         key: const ValueKey('player-quality'),
@@ -893,8 +1142,8 @@ class _PlayerControlsState extends State<PlayerControls> {
       if (widget.onSettings != null)
         _toolIcon(
           key: const ValueKey('player-settings'),
-          tooltip: '播放设置',
-          icon: Icons.tune_rounded,
+          tooltip: '更多',
+          icon: Icons.more_vert_rounded,
           onPressed: widget.enabled ? () => _panel(widget.onSettings!) : null,
         ),
       if (fullscreen)
@@ -1128,7 +1377,7 @@ class _PlayerControlsState extends State<PlayerControls> {
                       ),
                       const SizedBox(width: 3),
                       Text(
-                        '${PlayerInteractions.boostRate.toStringAsFixed(1)}x',
+                        '${widget.interactions.currentBoostRate.toStringAsFixed(1)}x',
                         style: const TextStyle(
                           color: Colors.white70,
                           fontSize: 12,
@@ -1217,32 +1466,40 @@ class _ProgressRowState extends State<_ProgressRow> {
     final duration = state.duration.inMilliseconds / 1000;
     final position = state.position.inMilliseconds / 1000;
     final buffered = state.buffer.inMilliseconds / 1000;
+    // B2：时间上下两行（已播在上、总时长在下），13sp，置于进度条左侧。
     final timeStyle = TextStyle(
-      fontSize: 12,
+      fontSize: 13,
+      height: 1.25,
       color: Colors.white.withValues(alpha: .82),
       fontFeatures: const [FontFeature.tabularFigures()],
     );
     return Padding(
       padding: const EdgeInsets.fromLTRB(8, 0, 8, 2),
       child: SizedBox(
-        height: 28,
+        height: 36,
         child: Row(
           children: [
             SizedBox(
-              width: 43,
-              child: Text(
-                formatPosition(_seekValue ?? position),
-                style: timeStyle,
-                textAlign: TextAlign.end,
+              width: 62,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    formatPosition(_seekValue ?? position),
+                    style: timeStyle,
+                  ),
+                  Text(formatPosition(duration), style: timeStyle),
+                ],
               ),
             ),
             Expanded(
               child: SliderTheme(
                 data: SliderTheme.of(context).copyWith(
-                  trackHeight: 3,
+                  trackHeight: 2,
                   secondaryActiveTrackColor: Colors.white38,
                   thumbShape: const RoundSliderThumbShape(
-                    enabledThumbRadius: 6,
+                    enabledThumbRadius: 7.5,
                   ),
                   overlayShape: const RoundSliderOverlayShape(
                     overlayRadius: 14,
@@ -1279,10 +1536,6 @@ class _ProgressRowState extends State<_ProgressRow> {
                   },
                 ),
               ),
-            ),
-            SizedBox(
-              width: 43,
-              child: Text(formatPosition(duration), style: timeStyle),
             ),
           ],
         ),

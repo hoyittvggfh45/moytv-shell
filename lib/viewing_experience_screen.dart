@@ -5,6 +5,11 @@ import 'tmdb/tmdb_config.dart';
 import 'tmdb/tmdb_settings_page.dart';
 import 'viewing_experience_settings.dart';
 
+/// 观看体验页（已瘦身，2026-11-27）：原页内的播放相关 6 项已删——
+/// 弹幕/广告过滤/预加载/无缝随播放偏好收进播放器内嵌菜单，深度
+/// 嗅探迁入内嵌菜单，M3U8 边下边播在全树无消费方（死开关）直接
+/// 摘除（存储字段保留兼容旧数据）。本页只剩外观与资料类：
+/// 沉浸式首页与详情、详情页海报背景、TMDB 资料配置。
 class ViewingExperienceScreen extends StatefulWidget {
   const ViewingExperienceScreen({super.key, required this.store});
 
@@ -40,31 +45,6 @@ class _ViewingExperienceScreenState extends State<ViewingExperienceScreen> {
     await next.save();
   }
 
-  Future<void> _updatePlayback({bool? danmaku, bool? adBlock}) async {
-    final prefs = widget.store.playbackPreferences;
-    await widget.store.setPlaybackPreferences(
-      prefs.copyWith(
-        danmaku: danmaku ?? prefs.danmaku,
-        adBlock: adBlock ?? prefs.adBlock,
-      ),
-    );
-    if (mounted) setState(() {});
-  }
-
-  /// 预加载 / 无缝走偏好上的联动方法：开无缝自动开预加载，
-  /// 关预加载连带关无缝，两个开关在本页与播放器菜单里状态一致。
-  Future<void> _updatePreload(bool value) async {
-    final prefs = widget.store.playbackPreferences;
-    await widget.store.setPlaybackPreferences(prefs.withPreload(value));
-    if (mounted) setState(() {});
-  }
-
-  Future<void> _updateSeamless(bool value) async {
-    final prefs = widget.store.playbackPreferences;
-    await widget.store.setPlaybackPreferences(prefs.withSeamless(value));
-    if (mounted) setState(() {});
-  }
-
   Future<void> _openTmdb() async {
     await Navigator.of(context).push<void>(
       MaterialPageRoute<void>(builder: (_) => const TmdbSettingsPage()),
@@ -82,98 +62,45 @@ class _ViewingExperienceScreenState extends State<ViewingExperienceScreen> {
       appBar: AppBar(title: const Text('观看体验')),
       body: settings == null || tmdb == null
           ? const Center(child: CircularProgressIndicator())
-          : AnimatedBuilder(
-              animation: widget.store,
-              builder: (context, _) {
-                final current = widget.store.playbackPreferences;
-                return Center(
-                  child: ConstrainedBox(
-                    constraints: const BoxConstraints(maxWidth: 720),
-                    child: ListView(
-                      padding: const EdgeInsets.all(16),
-                      children: [
-                        SwitchListTile(
-                          key: const ValueKey('viewing-immersive-switch'),
-                          title: const Text('沉浸式首页与详情'),
-                          subtitle: const Text('海报背景和玻璃控件；关闭恢复旧版'),
-                          value: settings.immersive,
-                          onChanged: (value) => _updateSettings(
-                            settings.copyWith(immersive: value),
-                          ),
-                        ),
-                        SwitchListTile(
-                          key: const ValueKey('viewing-detail-poster-switch'),
-                          title: const Text('详情页海报背景'),
-                          subtitle: const Text('用影片海报作详情页背景'),
-                          value: settings.detailPosterBackground,
-                          onChanged: (value) => _updateSettings(
-                            settings.copyWith(detailPosterBackground: value),
-                          ),
-                        ),
-                        ListTile(
-                          key: const ValueKey('viewing-tmdb-entry'),
-                          leading: const Icon(Icons.image_outlined),
-                          title: const Text('TMDB 资料配置'),
-                          subtitle: Text(
-                            tmdb.configured
-                                ? '已配置 apikey · 海报、背景、剧情与剧集预览'
-                                : '未配置 apikey',
-                          ),
-                          trailing: const Icon(Icons.chevron_right_rounded),
-                          onTap: _openTmdb,
-                        ),
-                        const Divider(),
-                        SwitchListTile(
-                          key: const ValueKey('viewing-danmaku-switch'),
-                          title: const Text('弹幕设置'),
-                          subtitle: const Text('播放时显示弹幕'),
-                          value: current.danmaku,
-                          onChanged: (value) => _updatePlayback(danmaku: value),
-                        ),
-                        SwitchListTile(
-                          key: const ValueKey('viewing-m3u8-switch'),
-                          title: const Text('M3U8 边下边播'),
-                          subtitle: const Text('播放时同步缓存当前 M3U8'),
-                          value: settings.m3u8DownloadWhilePlaying,
-                          onChanged: (value) => _updateSettings(
-                            settings.copyWith(m3u8DownloadWhilePlaying: value),
-                          ),
-                        ),
-                        SwitchListTile(
-                          key: const ValueKey('viewing-adblock-switch'),
-                          title: const Text('广告过滤'),
-                          subtitle: const Text('播放时过滤广告请求'),
-                          value: current.adBlock,
-                          onChanged: (value) => _updatePlayback(adBlock: value),
-                        ),
-                        SwitchListTile(
-                          key: const ValueKey('viewing-preload-switch'),
-                          title: const Text('下一集预加载'),
-                          subtitle: const Text('播放后段提前准备下一集地址；关闭会连带关闭无缝播放'),
-                          value: current.preload,
-                          onChanged: _updatePreload,
-                        ),
-                        SwitchListTile(
-                          key: const ValueKey('viewing-seamless-switch'),
-                          title: const Text('无缝播放'),
-                          subtitle: const Text('换集时首帧直接衔接不黑屏；开启时自动打开预加载。IJK 内核暂不支持，自动按普通换集播'),
-                          value: current.seamless,
-                          onChanged: _updateSeamless,
-                        ),
-                        SwitchListTile(
-                          key: const ValueKey('viewing-sniffer-switch'),
-                          title: const Text('深度嗅探'),
-                          subtitle: const Text('播不出来时自动嗅探播放地址'),
-                          value: settings.deepSniffer,
-                          onChanged: (value) => _updateSettings(
-                            settings.copyWith(deepSniffer: value),
-                          ),
-                        ),
-                      ],
+          : Center(
+              child: ConstrainedBox(
+                constraints: const BoxConstraints(maxWidth: 720),
+                child: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    SwitchListTile(
+                      key: const ValueKey('viewing-immersive-switch'),
+                      title: const Text('沉浸式首页与详情'),
+                      subtitle: const Text('海报背景和玻璃控件；关闭恢复旧版'),
+                      value: settings.immersive,
+                      onChanged: (value) => _updateSettings(
+                        settings.copyWith(immersive: value),
+                      ),
                     ),
-                  ),
-                );
-              },
+                    SwitchListTile(
+                      key: const ValueKey('viewing-detail-poster-switch'),
+                      title: const Text('详情页海报背景'),
+                      subtitle: const Text('用影片海报作详情页背景'),
+                      value: settings.detailPosterBackground,
+                      onChanged: (value) => _updateSettings(
+                        settings.copyWith(detailPosterBackground: value),
+                      ),
+                    ),
+                    ListTile(
+                      key: const ValueKey('viewing-tmdb-entry'),
+                      leading: const Icon(Icons.image_outlined),
+                      title: const Text('TMDB 资料配置'),
+                      subtitle: Text(
+                        tmdb.configured
+                            ? '已配置 apikey · 海报、背景、剧情与剧集预览'
+                            : '未配置 apikey',
+                      ),
+                      trailing: const Icon(Icons.chevron_right_rounded),
+                      onTap: _openTmdb,
+                    ),
+                  ],
+                ),
+              ),
             ),
     );
   }

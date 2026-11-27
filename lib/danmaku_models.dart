@@ -27,15 +27,26 @@ String trimDanmakuText(String text, int limit) {
   return String.fromCharCodes(runes.take(cut));
 }
 
+/// 弹幕出现方式：滚动（右→左）、顶部静止、底部静止、反向滚动
+/// （左→右）。服务端弹幕没有这个字段、恒为滚动；外部 XML 弹幕
+/// 按 B 站 mode 映射（1/2/3 滚动、5 顶部、4 底部、6 反向）。
+enum DanmakuMode { scroll, top, bottom, reverse }
+
 class DanmakuItem {
   const DanmakuItem({
     required this.id,
     required this.text,
     required this.timeMs,
+    this.mode = DanmakuMode.scroll,
+    this.colorValue,
   });
   final String id;
   final String text;
   final int timeMs;
+  final DanmakuMode mode;
+
+  /// 弹幕颜色（ARGB）；为空 = 默认白色（或按显示设置随机上色）。
+  final int? colorValue;
 }
 
 class DanmakuPage {

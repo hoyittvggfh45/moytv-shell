@@ -3,7 +3,6 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:moyi/local_store.dart';
 import 'package:moyi/plugin_market_screen.dart';
 import 'package:moyi/settings_screen.dart';
-import 'package:moyi/xigua/playback_settings_screen.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'fixtures.dart';
@@ -54,22 +53,20 @@ void main() {
     }
   }
 
-  testWidgets('generic settings carry all four merged entries', (
+  testWidgets('generic settings keep parse and minor entries only', (
     tester,
   ) async {
     await pumpSettings(tester, onHideAdult: () {});
     // 顺序须与页面自上而下一致：reveal 只向下拖，找过下面再回头
     // 找上面的项时该项已滑出构建范围、树里不存在。
-    // 内容源管理入口已搬到站点选择弹窗 + 号，不在设置里。
-    for (final keyName in [
-      'playback-settings-entry',
-      'player-entry',
-      'parse-settings-entry',
-      'minor-protection-entry',
-    ]) {
+    // 内容源管理入口已搬到站点选择弹窗 + 号，不在设置里；
+    // 播放设置/播放器选择已按 2026-11-27 口径移除。
+    for (final keyName in ['parse-settings-entry', 'minor-protection-entry']) {
       await reveal(tester, keyName);
       expect(find.byKey(ValueKey(keyName)), findsOneWidget);
     }
+    expect(find.byKey(const ValueKey('playback-settings-entry')), findsNothing);
+    expect(find.byKey(const ValueKey('player-entry')), findsNothing);
   });
 
   testWidgets('minor protection entry only shows with the callback', (
@@ -91,12 +88,16 @@ void main() {
     expect(hidden, 1);
   });
 
-  testWidgets('playback settings entry opens its sub page', (tester) async {
+  testWidgets('playback settings and player entries are removed', (
+    tester,
+  ) async {
+    // 2026-11-27 用户令：播放设置收进播放器内嵌菜单，设置页
+    // 「播放与画面」组里两个入口消失；解析接口保留。
     await pumpSettings(tester, onHideAdult: () {});
-    await reveal(tester, 'playback-settings-entry');
-    await tester.tap(find.byKey(const ValueKey('playback-settings-entry')));
-    await settle(tester);
-    expect(find.byType(PlaybackSettingsScreen), findsOneWidget);
+    await reveal(tester, 'parse-settings-entry');
+    expect(find.byKey(const ValueKey('playback-settings-entry')), findsNothing);
+    expect(find.byKey(const ValueKey('player-entry')), findsNothing);
+    expect(find.byKey(const ValueKey('parse-settings-entry')), findsWidgets);
   });
 
   testWidgets('plugin market entry lives in generic settings', (

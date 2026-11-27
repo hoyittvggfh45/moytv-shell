@@ -5,6 +5,10 @@ const playbackSpeeds = [.5, .75, 1.0, 1.25, 1.5, 2.0, 3.0];
 const holdSpeeds = [1.5, 2.0, 2.5, 3.0];
 const swipeSeekChoices = [15, 30, 60, 120];
 
+/// MPV 硬解模式可选项（mpv 的 hwdec 取值子集）：菜单里给用户选的
+/// 就这四档；auto-safe 是默认与参考口径一致。
+const hwdecModes = ['auto-safe', 'auto', 'mediacodec-copy', 'yes'];
+
 enum TelevisionDecoder { optimized, hardware, software }
 
 enum PlaybackOrientationMode {
@@ -36,6 +40,8 @@ class PlaybackPreferences {
     this.pictureQuality = const PictureQualityPreferences(),
     this.televisionDecoder = TelevisionDecoder.optimized,
     this.orientationMode = PlaybackOrientationMode.auto,
+    this.hardwareAcceleration = true,
+    this.hwdecMode = 'auto-safe',
   });
 
   final double speed;
@@ -59,6 +65,16 @@ class PlaybackPreferences {
   final TelevisionDecoder televisionDecoder;
   final PlaybackOrientationMode orientationMode;
 
+  /// 硬件加速总开关（仅 MPV 核、非电视路径）：关 = 强制软解
+  /// （hwdec=no）。电视路径有自己的解码档位，不读这两项。
+  final bool hardwareAcceleration;
+
+  /// 硬解模式（MPV hwdec 取值，见 [hwdecModes]）；总开关关时不生效。
+  final String hwdecMode;
+
+  /// 实际下发给 MPV 的 hwdec 值。
+  String get effectiveHwdec => hardwareAcceleration ? hwdecMode : 'no';
+
   PlaybackPreferences copyWith({
     double? speed,
     int? quality,
@@ -74,6 +90,8 @@ class PlaybackPreferences {
     PictureQualityPreferences? pictureQuality,
     TelevisionDecoder? televisionDecoder,
     PlaybackOrientationMode? orientationMode,
+    bool? hardwareAcceleration,
+    String? hwdecMode,
   }) => PlaybackPreferences(
     speed: speed ?? this.speed,
     quality: quality ?? this.quality,
@@ -89,6 +107,8 @@ class PlaybackPreferences {
     pictureQuality: pictureQuality ?? this.pictureQuality,
     televisionDecoder: televisionDecoder ?? this.televisionDecoder,
     orientationMode: orientationMode ?? this.orientationMode,
+    hardwareAcceleration: hardwareAcceleration ?? this.hardwareAcceleration,
+    hwdecMode: hwdecMode ?? this.hwdecMode,
   );
 
   /// 改预加载开关：关预加载连带关无缝（无缝靠预加载备好的
@@ -115,6 +135,8 @@ class PlaybackPreferences {
     'pictureQuality': pictureQuality.toJson(),
     'televisionDecoder': televisionDecoder.name,
     'orientationMode': orientationMode.name,
+    'hardwareAcceleration': hardwareAcceleration,
+    'hwdecMode': hwdecMode,
   };
 
   factory PlaybackPreferences.fromJson(Map<String, dynamic> value) {
@@ -131,6 +153,10 @@ class PlaybackPreferences {
     final holdSpeed = (value['holdSpeed'] as num? ?? 2).toDouble();
     final swipeSeekSeconds = value['swipeSeekSeconds'] as int? ?? 60;
     final autoPictureInPicture = value['autoPictureInPicture'] as bool? ?? true;
+    final hardwareAcceleration =
+        value['hardwareAcceleration'] as bool? ?? true;
+    final hwdecRaw = value['hwdecMode'] as String? ?? 'auto-safe';
+    final hwdecMode = hwdecModes.contains(hwdecRaw) ? hwdecRaw : 'auto-safe';
     if (!playbackSpeeds.contains(speed) ||
         !holdSpeeds.contains(holdSpeed) ||
         !swipeSeekChoices.contains(swipeSeekSeconds) ||
@@ -160,6 +186,8 @@ class PlaybackPreferences {
           PlaybackOrientationMode.values
               .asNameMap()[value['orientationMode']] ??
           PlaybackOrientationMode.auto,
+      hardwareAcceleration: hardwareAcceleration,
+      hwdecMode: hwdecMode,
     );
   }
 }

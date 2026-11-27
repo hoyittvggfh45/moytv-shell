@@ -7,7 +7,6 @@ import 'core_bridge.dart';
 import 'local_store.dart';
 import 'player_picker.dart';
 import 'settings_screen.dart';
-import 'xigua/playback_settings_screen.dart';
 
 class ZoneSettingsScreen extends StatelessWidget {
   const ZoneSettingsScreen({
@@ -76,14 +75,8 @@ class ZoneSettingsScreen extends StatelessWidget {
         break;
     }
     if (zone == HomeZone.live) {
-      entries.add(
-        _entry(
-          icon: Icons.play_circle_rounded,
-          label: '播放设置',
-          subtitle: '倍速、弹幕、自动连播与画质偏好',
-          onTap: () => _push(context, PlaybackSettingsScreen(store: store)),
-        ),
-      );
+      // 「播放设置」入口已随播放偏好迁入播放器内嵌菜单而移除
+      // （2026-11-27）；播放器选择（双播放器切换）保留。
       entries.add(
         _entry(
           icon: Icons.smart_display_rounded,

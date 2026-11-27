@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'app_page_route.dart';
 
@@ -8,6 +9,7 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:window_manager/window_manager.dart';
@@ -28,6 +30,8 @@ import 'jar_bridge.dart';
 import 'jar_youtube_takeover.dart';
 import 'danmaku_controller.dart';
 import 'danmaku_overlay.dart';
+import 'danmaku_settings.dart';
+import 'danmaku_xml.dart';
 import 'episode_frame_cache.dart';
 import 'episode_preview_card.dart';
 import 'exo_subtitle.dart';
@@ -64,7 +68,11 @@ import 'network_speed.dart';
 import 'tvbox_video_pane.dart';
 import 'tvbox_player_bridge.dart';
 import 'player_interactions.dart';
+import 'player_info_dialogs.dart';
 import 'player_menu.dart';
+import 'player_overlay_settings.dart';
+import 'sleep_timer.dart';
+import 'subtitle_style.dart';
 import 'television_controls.dart';
 import 'tmdb/tmdb_config.dart';
 import 'tmdb/tmdb_metadata.dart';
@@ -289,8 +297,23 @@ class _PlayerScreenState extends State<PlayerScreen>
   // _externalSubUrl 记录当前选中的外挂字幕，_subtitlesOff 记录关字幕。
   final Map<String, AudioTrack> _audioTrackById = {};
   final Map<String, SubtitleTrack> _subtitleTrackById = {};
+  final Map<String, VideoTrack> _videoTrackById = {};
   String? _externalSubUrl;
   bool _subtitlesOff = false;
+
+  /// 定时关闭（M1）：本播放页持有，到点停播；「播完本集」在
+  /// 播完处理里消费。页面关掉时在 dispose 里释放。
+  late final SleepTimerController _sleepTimer;
+
+  /// 画面变换（M4，仅 MPV 核，会话内状态不落盘）：左右/上下翻转
+  /// 走 MPV 的 vf 滤镜串，听视频走 vid=no；开播时在平台属性里
+  /// 一并下发，菜单里改完立即下发到当前播放器。
+  bool _flipHorizontal = false;
+  bool _flipVertical = false;
+  bool _audioOnly = false;
+
+  /// 观看体验设置整份（深度嗅探开关迁入菜单后要回写整份）。
+  ViewingExperienceSettings? _viewingSettings;
   NonVideoContent? _nonVideo;
 
   /// 开始播放回调已通知过的（集序号|取流地址）：同一集同一地址只
@@ -490,22 +513,35 @@ class _PlayerScreenState extends State<PlayerScreen>
       : _player.state.playing;
   VideoEnhancementController? get _enhancementForUi =>
       _enhancement.supported ? _enhancement : null;
-  PlaybackPreferences get _preferences => PlaybackPreferences(
-    speed: _useNativeHandle
-        ? _tvboxHandle.speed
-        : _useIjkCore
-        ? _ijkHandle.speed
-        : _speed,
-    quality: _requestedQuality,
-    autoAdvance: _autoAdvance,
-    danmaku: _danmakuEnabled,
-    preload: _preloadEnabled,
-    seamless: _seamlessEnabled,
-    adBlock: _adBlock,
-    enhancement: _enhancement.preferences,
-    televisionDecoder: _televisionDecoder,
-    orientationMode: _orientationMode,
-  );
+  PlaybackPreferences get _preferences {
+    // 本 getter 组装的对象会被 _setPreferencesInner 整份落盘：
+    // 运行时没有独立状态的字段（长按倍速/滑动快退/自动小窗/
+    // 画质档/硬解）必须从存储带回，否则菜单里改任何一项都会
+    // 把这些值冲回默认值。
+    final stored = widget.store.playbackPreferences;
+    return PlaybackPreferences(
+      speed: _useNativeHandle
+          ? _tvboxHandle.speed
+          : _useIjkCore
+          ? _ijkHandle.speed
+          : _speed,
+      quality: _requestedQuality,
+      autoAdvance: _autoAdvance,
+      danmaku: _danmakuEnabled,
+      preload: _preloadEnabled,
+      seamless: _seamlessEnabled,
+      adBlock: _adBlock,
+      holdSpeed: stored.holdSpeed,
+      swipeSeekSeconds: stored.swipeSeekSeconds,
+      autoPictureInPicture: stored.autoPictureInPicture,
+      enhancement: _enhancement.preferences,
+      pictureQuality: stored.pictureQuality,
+      televisionDecoder: _televisionDecoder,
+      orientationMode: _orientationMode,
+      hardwareAcceleration: stored.hardwareAcceleration,
+      hwdecMode: stored.hwdecMode,
+    );
+  }
   String get _qualityLabel => _plan?.local == true
       ? '本地原画'
       : _requestedQuality == 0
@@ -547,12 +583,18 @@ class _PlayerScreenState extends State<PlayerScreen>
     _core = PlayerCoreStorage.read(widget.store.preferences);
     _fallbackMode = CoreFallbackModeStorage.read(widget.store.preferences);
     _requestedQuality = preferences.quality;
-    _autoAdvance = true;
+    // 播放顺序（M5）与预加载按存量偏好走：此前这两项被强制为真、
+    // 菜单开关只是摆设，本批起按用户存的值真实生效。
+    _autoAdvance = preferences.autoAdvance;
     _danmakuEnabled = preferences.danmaku;
     _adBlock = preferences.adBlock;
     unawaited(_loadDeepSniffer());
     unawaited(_loadLiveSubtitleSettings());
-    _preloadEnabled = true;
+    _preloadEnabled = preferences.preload;
+    _sleepTimer = SleepTimerController(onExpire: _onSleepTimerExpired);
+    unawaited(DanmakuSettingsStore.instance.ensureLoaded());
+    unawaited(OverlaySettingsStore.instance.ensureLoaded());
+    unawaited(SubtitleStyleStore.instance.ensureLoaded());
     _seamlessEnabled = preferences.seamless;
     _televisionDecoder = preferences.televisionDecoder;
     _orientationMode = preferences.orientationMode;
@@ -664,6 +706,7 @@ class _PlayerScreenState extends State<PlayerScreen>
           !_panelOpen,
       baseSpeed: () => _speed,
       swipeSeek: () => widget.store.playbackPreferences.swipeSeekSeconds,
+      boostRateOf: () => widget.store.playbackPreferences.holdSpeed,
       onTogglePlayback: _togglePlayback,
       onSeek: _seekTo,
       onFullscreen: widget.embedded ? _notifyEmbeddedFullscreen : _rotate,
@@ -702,10 +745,12 @@ class _PlayerScreenState extends State<PlayerScreen>
             _acceptErrors &&
             _error == null) {
           final duration = _player.state.duration;
+          final sleepStop = _sleepTimer.consumeFinishEpisode();
           if (duration <= Duration.zero ||
               _player.state.position < duration - const Duration(seconds: 2)) {
             _queueRecovery();
-          } else if (_autoAdvance &&
+          } else if (!sleepStop &&
+              _autoAdvance &&
               _foreground &&
               !_panelOpen &&
               _index + 1 < widget.detail.episodes.length) {
@@ -1318,7 +1363,11 @@ class _PlayerScreenState extends State<PlayerScreen>
           );
           await platform.setProperty('demuxer-readahead-secs', '5');
         } else {
-          await platform.setProperty('hwdec', 'auto-safe');
+          // 硬解模式/硬件加速走播放偏好（M12/M14），不再写死。
+          await platform.setProperty(
+            'hwdec',
+            widget.store.playbackPreferences.effectiveHwdec,
+          );
           await platform.setProperty('hwdec-codecs', 'all');
           await platform.setProperty('vd-lavc-skiploopfilter', 'nonkey');
           await platform.setProperty('vd-lavc-threads', '4');
@@ -1345,6 +1394,15 @@ class _PlayerScreenState extends State<PlayerScreen>
         );
         await platform.setProperty('network-timeout', '20');
       }
+      // 画面变换（M4）与字幕样式（M18）随开播一并下发，
+      // 待命装置对调后行为一致。
+      final filters = [
+        if (_flipHorizontal) 'hflip',
+        if (_flipVertical) 'vflip',
+      ];
+      await platform.setProperty('vf', filters.join(','));
+      await platform.setProperty('vid', _audioOnly ? 'no' : 'auto');
+      await SubtitleStyleStore.instance.settings.applyTo(player);
     }
   }
 
@@ -1656,10 +1714,12 @@ class _PlayerScreenState extends State<PlayerScreen>
   void _onTvboxCompleted() {
     if (_loading || _closed || !_acceptErrors || _error != null) return;
     final duration = _tvboxHandle.duration;
+    final sleepStop = _sleepTimer.consumeFinishEpisode();
     if (duration <= Duration.zero ||
         _tvboxHandle.position < duration - const Duration(seconds: 2)) {
       _queueRecovery();
-    } else if (_autoAdvance &&
+    } else if (!sleepStop &&
+        _autoAdvance &&
         _foreground &&
         !_panelOpen &&
         _index + 1 < widget.detail.episodes.length) {
@@ -1677,10 +1737,12 @@ class _PlayerScreenState extends State<PlayerScreen>
   void _onIjkCompleted() {
     if (_loading || _closed || !_acceptErrors || _error != null) return;
     final duration = _ijkHandle.duration;
+    final sleepStop = _sleepTimer.consumeFinishEpisode();
     if (duration <= Duration.zero ||
         _ijkHandle.position < duration - const Duration(seconds: 2)) {
       _queueRecovery();
-    } else if (_autoAdvance &&
+    } else if (!sleepStop &&
+        _autoAdvance &&
         _foreground &&
         !_panelOpen &&
         _index + 1 < widget.detail.episodes.length) {
@@ -2644,6 +2706,186 @@ class _PlayerScreenState extends State<PlayerScreen>
     await _switchCore(next);
   }
 
+  /// 定时关闭到点：三路引擎一并停，进度照存。
+  void _onSleepTimerExpired() {
+    if (_closed || !mounted) return;
+    _playIntent = false;
+    _interactions.cancel();
+    unawaited(_player.pause());
+    unawaited(_tvboxHandle.pause());
+    unawaited(_ijkHandle.pause());
+    unawaited(_saveProgress());
+    _notice('定时关闭已到，已停止播放');
+  }
+
+  /// 播放地址信息（M2）：flag 取集数据自带字段，原始/实际地址与
+  /// 请求头取当前 plan；plan 还没就绪时各段为空、弹窗如实显示暂无。
+  PlaybackAddressInfo _playbackAddressInfo() {
+    final plan = _plan;
+    final episodes = widget.detail.episodes;
+    final flag = _index >= 0 && _index < episodes.length
+        ? (episodes[_index].raw['flag']?.toString() ?? '')
+        : '';
+    return PlaybackAddressInfo(
+      flag: flag,
+      originalUrl: plan?.originalUrl ?? '',
+      actualUrl: plan?.url ?? '',
+      headers: plan?.headers ?? const {},
+    );
+  }
+
+  /// 播放信息（M19）：仅 MPV 核有数据面（media_kit 参数/轨道/
+  /// 速率/变调＋MPV 属性 hwdec）；其余核返回空表，弹窗如实
+  /// 显示暂不提供。取不到的字段整段不列，不编造。
+  Future<List<(String, String)>> _playbackInfoSections() async {
+    if (_useNativeHandle || _useIjkCore) return const [];
+    final state = _player.state;
+    final sections = <(String, String)>[];
+    if ((state.width ?? 0) > 0 && (state.height ?? 0) > 0) {
+      sections.add(('Resolution', '${state.width}x${state.height}'));
+    }
+    final video = state.videoParams;
+    final videoFields = <String>[
+      if (video.pixelformat != null) 'pixelformat: ${video.pixelformat}',
+      if (video.w != null) 'w: ${video.w}',
+      if (video.h != null) 'h: ${video.h}',
+      if (video.dw != null) 'dw: ${video.dw}',
+      if (video.dh != null) 'dh: ${video.dh}',
+      if (video.aspect != null) 'aspect: ${video.aspect}',
+      if (video.par != null) 'par: ${video.par}',
+      if (video.colormatrix != null) 'colormatrix: ${video.colormatrix}',
+      if (video.colorlevels != null) 'colorlevels: ${video.colorlevels}',
+      if (video.primaries != null) 'primaries: ${video.primaries}',
+      if (video.gamma != null) 'gamma: ${video.gamma}',
+      if (video.sigPeak != null) 'sigPeak: ${video.sigPeak}',
+      if (video.light != null) 'light: ${video.light}',
+      if (video.chromaLocation != null)
+        'chromaLocation: ${video.chromaLocation}',
+      if (video.rotate != null) 'rotate: ${video.rotate}',
+      if (video.stereoIn != null) 'stereoIn: ${video.stereoIn}',
+      if (video.averageBpp != null) 'averageBpp: ${video.averageBpp}',
+      if (video.alpha != null) 'alpha: ${video.alpha}',
+    ];
+    if (videoFields.isNotEmpty) {
+      sections.add(('VideoParams', videoFields.join('\n')));
+    }
+    final audio = state.audioParams;
+    final audioFields = <String>[
+      if (audio.format != null) 'format: ${audio.format}',
+      if (audio.sampleRate != null) 'sampleRate: ${audio.sampleRate}',
+      if (audio.channels != null) 'channels: ${audio.channels}',
+      if (audio.channelCount != null) 'channelCount: ${audio.channelCount}',
+      if (audio.hrChannels != null) 'hrChannels: ${audio.hrChannels}',
+    ];
+    if (audioFields.isNotEmpty) {
+      sections.add(('AudioParams', audioFields.join('\n')));
+    }
+    final plan = _plan;
+    if (plan != null) {
+      sections.add((
+        'Media',
+        'url: ${plan.url}\n'
+            'headers: ${plan.headers}\n'
+            'route: ${plan.routeIndex + 1}/${plan.routeCount}',
+      ));
+    }
+    sections.add(('AudioTrack', '${state.track.audio}'));
+    sections.add(('VideoTrack', '${state.track.video}'));
+    sections.add(('pitch', '${state.pitch}'));
+    sections.add(('rate', '${state.rate}'));
+    final platform = _player.platform;
+    if (platform is NativePlayer) {
+      try {
+        final hwdec = await platform.getProperty('hwdec-current');
+        if (hwdec.isNotEmpty) sections.add(('hwdec', hwdec));
+      } catch (_) {
+        // 属性取不到就不列这一段。
+      }
+    }
+    return sections;
+  }
+
+  /// 弹幕加载·URL 路（M6）：拉 XML 文本→解析→交给弹幕控制器。
+  Future<int> _loadDanmakuFromUrl(String url) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null || !(uri.isScheme('http') || uri.isScheme('https'))) {
+      throw const FormatException('地址格式不对');
+    }
+    final client = HttpClient();
+    try {
+      final request = await client.getUrl(uri);
+      request.headers.set('User-Agent', 'Mozilla/5.0');
+      final response = await request.close();
+      if (response.statusCode < 200 || response.statusCode >= 300) {
+        throw HttpException('服务器返回 ${response.statusCode}');
+      }
+      final text = await response
+          .transform(const Utf8Decoder(allowMalformed: true))
+          .join();
+      final items = parseBilibiliDanmakuXml(text);
+      if (items.isEmpty) throw const FormatException('没有解析到弹幕条目');
+      return _danmaku.loadExternalItems(items);
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  /// 弹幕加载·本地文件路（M6）：选 XML 文件读文本解析；
+  /// 用户取消选择返回 null。
+  Future<int?> _loadDanmakuFromFile() async {
+    final file = await FilePicker.pickFile(
+      type: FileType.custom,
+      allowedExtensions: const ['xml'],
+    );
+    if (file == null) return null;
+    final path = file.path;
+    if (path == null || path.isEmpty) {
+      throw const FormatException('无法读取所选文件');
+    }
+    final text = await File(path).readAsString();
+    final items = parseBilibiliDanmakuXml(text);
+    if (items.isEmpty) throw const FormatException('没有解析到弹幕条目');
+    return _danmaku.loadExternalItems(items);
+  }
+
+  /// 投屏页（T7）：DLNA 协议栈未接，现阶段是如实标注的占位页
+  /// （设备列表为空＋未支持说明），不假装能投。
+  void _openCastPage(BuildContext hostContext) {
+    Navigator.of(hostContext).push(
+      MaterialPageRoute<void>(
+        builder: (_) => Scaffold(
+          appBar: AppBar(title: const Text('投屏')),
+          body: const Center(
+            child: Padding(
+              padding: EdgeInsets.all(24),
+              child: Text(
+                '暂未支持投屏功能\n设备列表为空，投屏协议（DLNA）接入后再开放。',
+                textAlign: TextAlign.center,
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 画面变换下发（M4，仅 MPV）：vf 滤镜串与 vid 属性立即打到
+  /// 当前播放器；开播时 _applyMpvPlatformProperties 也会带上。
+  Future<void> _applyVideoTransform() async {
+    final platform = _player.platform;
+    if (platform is! NativePlayer) return;
+    try {
+      final filters = [
+        if (_flipHorizontal) 'hflip',
+        if (_flipVertical) 'vflip',
+      ];
+      await platform.setProperty('vf', filters.join(','));
+      await platform.setProperty('vid', _audioOnly ? 'no' : 'auto');
+    } catch (_) {
+      // 下发失败保持现状，不挡播放。
+    }
+  }
+
   Future<void> _switchCore(PlayerCore next) async {
     if (_closed) return;
     _discardSeamlessStandby();
@@ -2922,8 +3164,24 @@ class _PlayerScreenState extends State<PlayerScreen>
   Future<void> _loadDeepSniffer() async {
     try {
       final settings = await ViewingExperienceSettings.load();
-      if (mounted) setState(() => _deepSniffer = settings.deepSniffer);
+      if (mounted) {
+        setState(() {
+          _viewingSettings = settings;
+          _deepSniffer = settings.deepSniffer;
+        });
+      }
     } catch (_) {}
+  }
+
+  /// 深度嗅探开关（观看体验页迁入菜单）：回写整份观看体验设置，
+  /// 本页 _deepSniffer 同步换值，嗅探路径即时按新值走。
+  Future<void> _setDeepSniffer(bool value) async {
+    final current = _viewingSettings ?? await ViewingExperienceSettings.load();
+    final next = current.copyWith(deepSniffer: value);
+    _viewingSettings = next;
+    if (mounted && !_closed) setState(() => _deepSniffer = value);
+    await next.save();
+    _menuRevision.value++;
   }
 
   /// 选集预览图用的 TMDB 元数据：与详情页同一条路（标题 + 年份 +
@@ -3141,10 +3399,12 @@ class _PlayerScreenState extends State<PlayerScreen>
   Future<void> _setPreferencesInner(PlaybackPreferences preferences) async {
     _interactions.cancel();
     final adBlockChanged = preferences.adBlock != _adBlock;
-    final nextPreferences = preferences.copyWith(
-      autoAdvance: true,
-      preload: true,
-    );
+    // 不再强制 autoAdvance/preload 为真（旧口径让菜单里的
+    // 「自动连播/预加载」开关成摆设）：按用户存的值整份落盘。
+    final nextPreferences = preferences;
+    final storedBefore = widget.store.playbackPreferences;
+    final hwdecChanged =
+        nextPreferences.effectiveHwdec != storedBefore.effectiveHwdec;
     await widget.store.setPlaybackPreferences(nextPreferences);
     if (!mounted || _closed || widget.store.profileEpoch != _profileEpoch)
       return;
@@ -3155,13 +3415,24 @@ class _PlayerScreenState extends State<PlayerScreen>
         nextPreferences.orientationMode != _orientationMode;
     _enhancement.setPreferences(nextPreferences.enhancement);
     unawaited(_pictureQuality.apply(nextPreferences.pictureQuality));
+    if (hwdecChanged && !_useNativeHandle && !_useIjkCore) {
+      // 硬解模式/硬件加速改完立即下发当前 MPV 播放器，不等重开播。
+      final platform = _player.platform;
+      if (platform is NativePlayer) {
+        try {
+          await platform.setProperty('hwdec', nextPreferences.effectiveHwdec);
+        } catch (_) {
+          // 下发失败不挡设置保存，下次开播按新值走平台属性。
+        }
+      }
+    }
     setState(() {
       _speed = nextPreferences.speed;
       _requestedQuality = nextPreferences.quality;
-      _autoAdvance = true;
+      _autoAdvance = nextPreferences.autoAdvance;
       _danmakuEnabled = nextPreferences.danmaku;
       _adBlock = nextPreferences.adBlock;
-      _preloadEnabled = true;
+      _preloadEnabled = nextPreferences.preload;
       _seamlessEnabled = nextPreferences.seamless;
       _televisionDecoder = nextPreferences.televisionDecoder;
       _orientationMode = nextPreferences.orientationMode;
@@ -3253,6 +3524,26 @@ class _PlayerScreenState extends State<PlayerScreen>
     );
   }
 
+  List<TrackMenuEntry> _buildVideoTrackEntries() {
+    _videoTrackById.clear();
+    final choices = <TrackChoice>[];
+    for (final track in _player.state.tracks.video) {
+      if (track.id == 'auto' || track.id == 'no') continue;
+      _videoTrackById[track.id] = track;
+      choices.add(
+        TrackChoice(
+          id: track.id,
+          title: track.title ?? '',
+          language: track.language ?? '',
+        ),
+      );
+    }
+    return buildVideoTrackEntries(
+      choices,
+      selectedId: _player.state.track.video.id,
+    );
+  }
+
   List<TrackMenuEntry> _buildSubtitleTrackEntries() {
     _subtitleTrackById.clear();
     final choices = <TrackChoice>[];
@@ -3286,6 +3577,9 @@ class _PlayerScreenState extends State<PlayerScreen>
         case TrackMenuEntryKind.audio:
           final track = _audioTrackById[entry.id];
           if (track != null) await _player.setAudioTrack(track);
+        case TrackMenuEntryKind.video:
+          final track = _videoTrackById[entry.id];
+          if (track != null) await _player.setVideoTrack(track);
         case TrackMenuEntryKind.subtitleOff:
           await _player.setSubtitleTrack(SubtitleTrack.no());
           _externalSubUrl = null;
@@ -3330,6 +3624,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             widget.store,
             _danmaku,
             _preloader,
+            _sleepTimer,
           ]),
           builder: (_, _) => Theme(
             data: menuTheme,
@@ -3365,6 +3660,9 @@ class _PlayerScreenState extends State<PlayerScreen>
               audioTrackEntries: _useNativeHandle || _useIjkCore
                   ? const []
                   : _buildAudioTrackEntries(),
+              videoTrackEntries: _useNativeHandle || _useIjkCore
+                  ? const []
+                  : _buildVideoTrackEntries(),
               subtitleTrackEntries: _useNativeHandle || _useIjkCore
                   ? const []
                   : _buildSubtitleTrackEntries(),
@@ -3376,6 +3674,69 @@ class _PlayerScreenState extends State<PlayerScreen>
                 widget.detail.drama.id,
                 next,
               ),
+              onIntroOutroEnabledChanged: (value) async {
+                await widget.store.setIntroOutroSkipEnabled(value);
+                _menuRevision.value++;
+              },
+              onReload: () => _retry(),
+              sleepTimer: _sleepTimer,
+              onShowAddress: (menuContext) => showPlaybackAddressDialog(
+                menuContext,
+                _playbackAddressInfo(),
+              ),
+              onShowInfo: (menuContext) async {
+                final sections = await _playbackInfoSections();
+                if (menuContext.mounted) {
+                  await showPlaybackInfoDialog(menuContext, sections);
+                }
+              },
+              onLoadDanmakuFromUrl: _loadDanmakuFromUrl,
+              onLoadDanmakuFromFile: _loadDanmakuFromFile,
+              danmakuSettingsStore: DanmakuSettingsStore.instance,
+              overlaySettingsStore: OverlaySettingsStore.instance,
+              mpvControls: !_television && !_useNativeHandle && !_useIjkCore,
+              flipHorizontal: _flipHorizontal,
+              flipVertical: _flipVertical,
+              audioOnly: _audioOnly,
+              onFlipHorizontal: (value) {
+                setState(() => _flipHorizontal = value);
+                unawaited(_applyVideoTransform());
+                _menuRevision.value++;
+              },
+              onFlipVertical: (value) {
+                setState(() => _flipVertical = value);
+                unawaited(_applyVideoTransform());
+                _menuRevision.value++;
+              },
+              onAudioOnly: (value) {
+                setState(() => _audioOnly = value);
+                unawaited(_applyVideoTransform());
+                _menuRevision.value++;
+              },
+              coreFallbackMode: _fallbackMode,
+              onCoreFallbackChanged: (mode) async {
+                await CoreFallbackModeStorage.write(
+                  widget.store.preferences,
+                  mode,
+                );
+                if (_closed) return;
+                setState(() => _fallbackMode = mode);
+                // 已建的回退控制器按旧档位构造，清掉让下次失败时
+                // 按新档位重建（_play 起点也会重建）。
+                _coreFallback = null;
+                _menuRevision.value++;
+              },
+              seasonAutoplay: widget.store.hongguoSeasonAutoplay,
+              onSeasonAutoplayChanged: (value) async {
+                await widget.store.setHongguoSeasonAutoplay(value);
+                _menuRevision.value++;
+              },
+              subtitleStyleStore: SubtitleStyleStore.instance,
+              onSubtitleStyleChanged: (settings) =>
+                  unawaited(settings.applyTo(_player)),
+              deepSniffer: _deepSniffer,
+              onDeepSnifferChanged: (value) =>
+                  unawaited(_setDeepSniffer(value)),
             ),
           ),
         ),
@@ -3687,6 +4048,7 @@ class _PlayerScreenState extends State<PlayerScreen>
     final enhancementClosed = _enhancement.close();
     widget.store.removeListener(_accessChanged);
     _danmaku.dispose();
+    _sleepTimer.dispose();
     _preloader.dispose();
     _generation++;
     WidgetsBinding.instance.removeObserver(this);
@@ -4374,7 +4736,7 @@ class _PlayerScreenState extends State<PlayerScreen>
             },
             onSpeed: () => _openPanel(PlayerMenuSection.speed),
             onQuality: () => _openPanel(PlayerMenuSection.quality),
-            onSettings: () => _openPanel(PlayerMenuSection.settings),
+            onSettings: () => _openPanel(PlayerMenuSection.more),
             onDanmaku: widget.detail.drama.source == 'hongguo'
                 ? _toggleDanmaku
                 : null,
@@ -4412,12 +4774,29 @@ class _PlayerScreenState extends State<PlayerScreen>
             onOrientationMode: _mobile ? _setOrientationMode : null,
             core: _effectiveCore,
             onCoreTap: _openCoreDialog,
+            coreOptions: playerCoreOptions(
+              exoAvailable: Platform.isAndroid,
+              ijkAvailable: Platform.isAndroid,
+            ),
+            onCoreSelected: (core) {
+              if (core != _effectiveCore) unawaited(_switchCore(core));
+            },
+            onCast: () => _openCastPage(context),
+            overlaySettings: OverlaySettingsStore.instance.settings,
           );
     final layeredControls = Stack(
       fit: StackFit.expand,
       children: [
         if (!hideOverlayForPictureInPicture)
-          DanmakuOverlay(controller: _danmaku, aspectRatio: _aspectRatio),
+          AnimatedBuilder(
+            animation: DanmakuSettingsStore.instance,
+            builder: (_, _) => DanmakuOverlay(
+              controller: _danmaku,
+              aspectRatio: _aspectRatio,
+              settings: DanmakuSettingsStore.instance.settings,
+              fullscreen: _showFullscreen,
+            ),
+          ),
         controls,
       ],
     );

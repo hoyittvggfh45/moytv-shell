@@ -65,10 +65,17 @@ class DanmakuController extends ChangeNotifier {
   int dataRevision = 0;
   List<DanmakuItem> _remoteItems = const [];
   List<DanmakuItem> _localItems = const [];
+  List<DanmakuItem> _externalItems = const [];
   String? _localKey;
   int _localLoadToken = 0;
 
-  List<DanmakuItem> get items => [..._remoteItems, ..._localItems];
+  List<DanmakuItem> get items => [
+    ..._remoteItems,
+    ..._localItems,
+    ..._externalItems,
+  ];
+
+  int get externalCount => _externalItems.length;
 
   bool get supported =>
       _plan != null &&
@@ -94,7 +101,19 @@ class DanmakuController extends ChangeNotifier {
       durationMs > 0 &&
       positionMs < durationMs &&
       _localItems.isNotEmpty;
-  bool get anyVisible => visible || localVisible;
+
+  /// 外挂弹幕（URL/本地 XML 手动加载）：不依赖服务端弹幕支持，
+  /// 只要播放就绪且有条目就显示，与本地弹幕同门槛。
+  bool get externalVisible =>
+      !_closed &&
+      _enabled &&
+      _available &&
+      _foreground &&
+      !_seeking &&
+      durationMs > 0 &&
+      positionMs < durationMs &&
+      _externalItems.isNotEmpty;
+  bool get anyVisible => visible || localVisible || externalVisible;
   bool get anyMoving =>
       anyVisible && _playing && !_buffering;
   bool get canSendLocal => _localKey != null;
@@ -129,9 +148,21 @@ class DanmakuController extends ChangeNotifier {
     positionMs = durationMs = 0;
     _resetMotion();
     _localItems = const [];
+    // 外挂弹幕是按集加载的，换集即清，不串到下一集。
+    _externalItems = const [];
     _localKey = _computeLocalKey();
     _loadLocal();
     notifyListeners();
+  }
+
+  /// 载入外挂弹幕（弹幕加载弹窗解析后的条目）：整表替换上一批
+  /// 外挂弹幕，与服务端/本地弹幕并存显示。返回载入条数。
+  int loadExternalItems(List<DanmakuItem> items) {
+    if (_closed) return 0;
+    _externalItems = List.unmodifiable(items);
+    dataRevision++;
+    notifyListeners();
+    return _externalItems.length;
   }
 
   void setById(String? seriesId, String? videoId) {

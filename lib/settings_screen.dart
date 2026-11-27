@@ -31,7 +31,6 @@ import 'jar_bridge.dart';
 import 'py_bridge.dart';
 import 'import_center_screen.dart';
 import 'parse_settings_screen.dart';
-import 'xigua/playback_settings_screen.dart';
 import 'plugin_market_screen.dart';
 import 'liquid_glass.dart';
 import 'neon_glass_kit.dart';
@@ -51,7 +50,6 @@ import 'hongguo_login_page.dart';
 import 'app_layout.dart';
 import 'models.dart';
 import 'playback_launch_screen.dart';
-import 'player_picker.dart';
 import 'saved_library.dart';
 import 'detail_screen.dart';
 import 'vod_detail_route.dart';
@@ -358,24 +356,10 @@ class _SettingsScreenState extends State<SettingsScreen>
     final liveSettings = LiveSettingsStore.instance.settings;
     return [
       _SettingsGroup('播放与画面', [
-        // 原片库设置页五项并入通用设置（2026-11-14）：播放设置、解析接口
-        // 与未成年保护新增于此；播放器选择、内容源管理原已在本页。
-        _SettingsItem(
-          keyName: 'playback-settings-entry',
-          icon: Icons.play_circle_rounded,
-          lucide: LucideIcons.play,
-          title: '播放设置',
-          detail: '倍速、弹幕、自动连播与画质偏好',
-          onTap: () => _push(PlaybackSettingsScreen(store: store)),
-        ),
-        _SettingsItem(
-          keyName: 'player-entry',
-          icon: Icons.play_circle_outline_rounded,
-          lucide: LucideIcons.circlePlay,
-          title: '播放器选择',
-          detail: '解码内核与播放优先级',
-          onTap: () => _push(PlayerPickerScreen(store: store)),
-        ),
+        // 播放设置与播放器选择已按用户口径移除（2026-11-27）：播放
+        // 偏好收进播放器内嵌「更多」菜单；播放器选择（guo/xigua 双
+        // 播放器切换）仍可从直播区设置页与短视频页进入，本组不再挂。
+        // 解析接口与未成年保护保留于此。
         _SettingsItem(
           keyName: 'parse-settings-entry',
           icon: Icons.link_rounded,

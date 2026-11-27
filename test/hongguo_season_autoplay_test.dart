@@ -2,7 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:moyi/hongguo_season_countdown.dart';
 import 'package:moyi/local_store.dart';
-import 'package:moyi/xigua/playback_settings_screen.dart';
+import 'package:moyi/models.dart';
+import 'package:moyi/player_menu.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 class _CountdownHarness extends StatefulWidget {
@@ -47,6 +48,24 @@ class _CountdownHarnessState extends State<_CountdownHarness> {
       ],
     ),
   );
+}
+
+
+/// 菜单内有多个 Scrollable，scrollUntilVisible 默认取 .single 会炸；
+/// 改用拖动 SingleChildScrollView 直到目标滚进可视区。
+Future<void> revealInMenu(WidgetTester tester, Finder finder) async {
+  final scrollable = find.byType(SingleChildScrollView).first;
+  for (var i = 0; i < 40; i++) {
+    if (finder.evaluate().isNotEmpty) {
+      final view = tester.getRect(scrollable);
+      final item = tester.getRect(finder);
+      if (item.center.dy >= view.top && item.center.dy <= view.bottom) {
+        return;
+      }
+    }
+    await tester.drag(scrollable, const Offset(0, -320));
+    await tester.pump(const Duration(milliseconds: 60));
+  }
 }
 
 void main() {
@@ -141,17 +160,56 @@ void main() {
       return LocalStore(await SharedPreferences.getInstance());
     }
 
+    // 开关已随播放偏好迁入播放器内嵌「更多」菜单（2026-11-27）：
+    // 用与播放页相同的接法（偏好/跨季都写 LocalStore）搭菜单。
+    Future<void> pumpMenu(WidgetTester tester, LocalStore store) async {
+      tester.view.physicalSize = const Size(800, 1400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.resetPhysicalSize);
+      addTearDown(tester.view.resetDevicePixelRatio);
+      final episodes = [
+        Episode(const {'id': 'e1', 'currentEpisode': 1}, 1),
+        Episode(const {'id': 'e2', 'currentEpisode': 2}, 2),
+      ];
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: StatefulBuilder(
+              builder: (context, setState) => PlayerMenu(
+                section: PlayerMenuSection.more,
+                episodes: episodes,
+                currentIndex: 0,
+                preferences: store.playbackPreferences,
+                qualities: const [],
+                actualQuality: 0,
+                local: false,
+                favorite: false,
+                mobile: true,
+                onEpisode: (_) {},
+                onPreferences: (next) async {
+                  await store.setPlaybackPreferences(next);
+                  setState(() {});
+                },
+                onFavorite: () async {},
+                seasonAutoplay: store.hongguoSeasonAutoplay,
+                onSeasonAutoplayChanged: (value) async {
+                  await store.setHongguoSeasonAutoplay(value);
+                  setState(() {});
+                },
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
     testWidgets('默认开，点按切换写读生效', (tester) async {
       final store = await freshStore();
       expect(store.hongguoSeasonAutoplay, isTrue);
-      await tester.pumpWidget(
-        MaterialApp(home: PlaybackSettingsScreen(store: store)),
-      );
-      await tester.pump();
+      await pumpMenu(tester, store);
       final tile = find.byKey(const ValueKey('season-autoplay-switch'));
-      // 设置列表按需建子项：开关在折叠线下时须先滚进画面才建出来。
-      await tester.scrollUntilVisible(tile, 200);
-      await tester.pump();
+      await revealInMenu(tester, tile);
       expect(tile, findsOneWidget);
       expect(tester.widget<SwitchListTile>(tile).value, isTrue);
       await tester.tap(tile);
@@ -164,27 +222,18 @@ void main() {
     });
 
     testWidgets('自动连播关掉时副标题说明开关暂不生效', (tester) async {
-      tester.view.physicalSize = const Size(800, 1400);
-      tester.view.devicePixelRatio = 1.0;
-      addTearDown(tester.view.resetPhysicalSize);
-      addTearDown(tester.view.resetDevicePixelRatio);
       final store = await freshStore();
-      await tester.pumpWidget(
-        MaterialApp(home: PlaybackSettingsScreen(store: store)),
-      );
+      await pumpMenu(tester, store);
+      // 播放顺序选「播完暂停」= 关掉自动连播。
+      final stopChip = find.byKey(const ValueKey('more-play-order-stop'));
+      await revealInMenu(tester, stopChip);
+      await tester.tap(stopChip);
       await tester.pump();
-      final autoAdvance = find.ancestor(
-        of: find.text('自动连播'),
-        matching: find.byType(SwitchListTile),
-      );
-      await tester.scrollUntilVisible(autoAdvance, 200);
-      await tester.tap(autoAdvance);
-      await tester.pump();
-      await tester.scrollUntilVisible(
+      expect(store.playbackPreferences.autoAdvance, isFalse);
+      await revealInMenu(
+        tester,
         find.byKey(const ValueKey('season-autoplay-switch')),
-        200,
       );
-      await tester.pump();
       expect(find.text('自动连播未开，本开关暂不生效。'), findsOneWidget);
     });
   });

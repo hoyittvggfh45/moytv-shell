@@ -22,6 +22,7 @@ class PlayerInteractions extends ChangeNotifier {
     this.onSeek,
     this.onBrightness,
     this.currentBrightness,
+    this.boostRateOf,
   }) {
     _playing = player.stream.playing.listen((playing) {
       if (!playing) cancel();
@@ -38,6 +39,12 @@ class PlayerInteractions extends ChangeNotifier {
   final Future<void> Function(Duration)? onSeek;
   final Future<void> Function(double value)? onBrightness;
   final double? Function()? currentBrightness;
+
+  /// 长按临时倍速的取值回调（读播放偏好 holdSpeed）；为空时用
+  /// [boostRate] 默认 2x。与 swipeSeek 同法，改偏好即时生效。
+  final double Function()? boostRateOf;
+
+  double get currentBoostRate => boostRateOf?.call() ?? boostRate;
   late final StreamSubscription<bool> _playing;
   Timer? _holdTimer;
   Timer? _hintTimer;
@@ -120,7 +127,7 @@ class PlayerInteractions extends ChangeNotifier {
       }
       _boosting = true;
       _held = true;
-      unawaited(_setRate(boostRate));
+      unawaited(_setRate(currentBoostRate));
       hint('');
       notifyListeners();
     });
