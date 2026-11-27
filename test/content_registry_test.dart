@@ -21,6 +21,7 @@ void main() {
           'bookan',
           'hysxs',
           'asmrmoon',
+          'asmrhoney',
           'jar_tingshu',
         ],
       );
@@ -39,6 +40,7 @@ void main() {
           '博看听书',
           '🔞H有声小说',
           '🔞ASMR MOON',
+          '🔞ASMRHoney',
           '飞卢听书',
         ],
       );
@@ -60,6 +62,7 @@ void main() {
           'bookan',
           'hysxs',
           'asmrmoon',
+          'asmrhoney',
           'jar_tingshu',
         ],
       );
@@ -114,6 +117,7 @@ void main() {
           'bookan',
           'hysxs',
           'asmrmoon',
+          'asmrhoney',
           'jar_tingshu',
         ],
       );

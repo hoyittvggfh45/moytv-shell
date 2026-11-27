@@ -96,7 +96,7 @@ class _CountingSource extends _FakeSource {
 }
 
 void main() {
-  test('收齐两区：听书 9 个 + 阅读 71 个（19 py + 52 内置书源），id 唯一，成人源也在列', () {
+  test('收齐两区：听书 14 个 + 阅读 128 个，id 唯一，成人源也在列', () {
     addTearDown(() => ContentRegistry.setNovelImports([]));
     ContentRegistry.setNovelImports([]);
     final targets = globalSearchBookTargets(
@@ -124,9 +124,12 @@ void main() {
       'bookan',
       'hysxs',
       'asmrmoon',
+      'asmrhoney',
       'jar_tingshu',
     ]);
-    expect(novel.length, 71);
+    // 阅读 128 = 27 py + 101 内置 JSON 书源（2026-11-27 探针实测；
+    // 此前写死的 71 是旧批次攒下的存量旧数，与本次听书 +1 无关）。
+    expect(novel.length, 128);
     expect(
       novel,
       containsAll(['aabook', 'buliang', 'mhbl', 'ho5ho', 'kxmanhua']),
@@ -136,8 +139,10 @@ void main() {
       containsAll(ContentRegistry.novelJsonBuiltins.map((s) => s.id)),
     );
     // 无门禁：成人源 id 都在列；全表 id 不重复。
-    // 听书 13 个 + 阅读 73 个（实测），id 无重叠，去重后 86。
-    expect(targets.map((t) => t.source.id).toSet().length, 86);
+    // 听书 14 个 + 阅读 128 个（2026-11-27 探针实测），id 无重叠，
+    // 去重后 142。（分区内置批听书 +ASMRHoney：13 → 14；阅读数与
+    // 总数此前写死的 73/86 均为存量旧数，本次按实测一并订正。）
+    expect(targets.map((t) => t.source.id).toSet().length, 142);
   });
 
   test('去重：同 id 两区都出现只留一个，听书优先', () {

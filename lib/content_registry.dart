@@ -68,6 +68,14 @@ class ContentRegistry {
       name: '🔞ASMR MOON',
       assetPath: 'assets/audio_spiders/asmrmoon.py',
     ),
+    // 分区内置批（2026-11-27）：ASMRHoney 音声站，用户 18:58 改令
+    // 「声音站也要」后回到内置清单；听书 py 全链验过（6 分类、
+    // 273 创作者文件夹下钻、专辑多轨），内容含 MP4 视频短片条目。
+    PyContentSource(
+      id: 'asmrhoney',
+      name: '🔞ASMRHoney',
+      assetPath: 'assets/audio_spiders/asmrhoney.py',
+    ),
     JarAudioContentSource(),
     FanqieMusicSource(_http),
   ];

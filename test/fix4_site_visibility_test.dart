@@ -35,6 +35,7 @@ void main() {
       'bookan',
       'hysxs',
       'asmrmoon',
+      'asmrhoney',
       'jar_tingshu',
     ]);
   });
