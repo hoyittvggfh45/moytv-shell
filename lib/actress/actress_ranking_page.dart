@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import 'actress_database.dart';
 import 'actress_detail_page.dart';
+import 'javdb_api.dart';
 import 'actress_models.dart';
 import 'actress_widgets.dart';
 import '../core_bridge.dart';
@@ -67,6 +68,7 @@ class _ActressRankingPageState extends State<ActressRankingPage> {
           repository: widget.repository,
           store: widget.store,
           database: widget.database,
+          javdbClient: JavdbApiClient(),
         ),
       ),
     );

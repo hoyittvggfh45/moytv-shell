@@ -815,6 +815,8 @@ class _ActressNvkuPageState extends State<ActressNvkuPage> {
                       initialQuery: _onlineQuery,
                       repository: widget.repository,
                       store: widget.store,
+                      database:
+                          widget.database ?? SqfliteActressDatabase.instance,
                     )
                   : online
                   ? ActressOnlineSourceView(

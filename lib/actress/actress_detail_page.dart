@@ -8,6 +8,8 @@ import 'actress_database.dart';
 import 'actress_film_library.dart';
 import 'actress_json_fallback.dart';
 import 'actress_models.dart';
+import 'javdb_actress_merge.dart';
+import 'javdb_api.dart';
 import 'actress_online_detail.dart';
 import 'actress_online_parse.dart';
 import 'actress_online_sources.dart';
@@ -49,6 +51,7 @@ class ActressDetailPage extends StatefulWidget {
     this.fallback,
     this.filmDb,
     this.verifyFetch,
+    this.javdbClient,
   });
 
   final int localId;
@@ -77,6 +80,12 @@ class ActressDetailPage extends StatefulWidget {
   /// 测试注入：存的地址验活探针；不传时用 [probeStreamHead]。
   @visibleForTesting
   final FeedProbeFetch? verifyFetch;
+
+  /// JavDB 合并客户端（2026-11-27 问题 2）：传了才在本地作品
+  /// 之后补 JavDB 作品（按归一番号去重、同番号只留本地库）；
+  /// 不传时本页保持纯本地行为（测试与无 JavDB 的入口）。生产
+  /// 入口（列表页/排行榜/JavDB 演员页）显式传真客户端。
+  final JavdbApiClient? javdbClient;
 
   @override
   State<ActressDetailPage> createState() => _ActressDetailPageState();
@@ -118,6 +127,10 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
 
   /// json 补的作品数（只在无分类筛选时补，见 _supplementJsonWorks）。
   var _jsonWorksCount = 0;
+
+  /// JavDB 补的作品数（只在无分类筛选时补，见
+  /// _supplementJavdbWorks；与 json 补同一口径计入头顶总数）。
+  var _javdbWorksCount = 0;
 
   /// 头顶“作品 N 部”显示的总数：数据库入库数 + json 补的数（无筛选时）。
   /// 选了分类也不变（只算入库总数，不受筛选影响）；json 没补上之前
@@ -506,6 +519,7 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
           _works = works;
           _dbWorksCount = works.length;
           _jsonWorksCount = 0;
+          _javdbWorksCount = 0;
           _filteredTotal = filteredTotal;
           // 无筛选时头顶总数就是数据库总数（json 补上后在 _supplementJsonWorks
           // 里再加）；选了分类/标签不改头顶总数。
@@ -516,8 +530,11 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
           _loading = false;
           _worksError = null;
         });
-        // 首屏先出数据库作品，json 补的作品后台接上（不 await，不堵首屏）。
+        // 首屏先出数据库作品，json 补与 JavDB 补的作品后台接上
+        // （不 await、不堵首屏）；两路并行，各自在落卡前按当时
+        // 的 _works 再过一遍归一番号去重，同番号只留先到那条。
         unawaited(_supplementJsonWorks());
+        unawaited(_supplementJavdbWorks());
       } catch (e) {
         if (!mounted || generation != _generation) return;
         setState(() {
@@ -667,6 +684,60 @@ class _ActressDetailPageState extends State<ActressDetailPage> {
     setState(() {
       _works = [..._works, ...extra];
       _jsonWorksCount = extra.length;
+      _filteredTotal += extra.length;
+      _headerTotal = _filteredTotal;
+      _hasMore = _works.length < _filteredTotal;
+    });
+  }
+
+  /// JavDB 作品补充（2026-11-27 问题 2 合并）：按女优名向
+  /// JavDB 搜作品，本地库（含 json 已补）没有的番号才补进来
+  /// ——归一番号去重、同番号只留本地库那条（播放优先本地库
+  /// 线路）。口径与 json 补一致：只在无分类/标签筛选时补、
+  /// 不堵首屏、拉不到静默不补、不拿假数据凑数。补进来的卡
+  /// 点播走本页既有番号竞速（JavDB 本身不给播放线路，播放
+  /// 按番号搜线路，与 openJavdbWork 同一模型）。
+  Future<void> _supplementJavdbWorks() async {
+    final client = widget.javdbClient;
+    final person = _person;
+    if (client == null || person == null) return;
+    if (_selectedCategory != null ||
+        _selectedTag.isNotEmpty ||
+        _javdbWorksCount > 0) {
+      return;
+    }
+    final generation = _generation;
+    List<JavdbMovie> movies;
+    try {
+      movies = await client.searchMovies(person.displayName);
+    } catch (_) {
+      return;
+    }
+    if (!mounted || generation != _generation) return;
+    if (_selectedCategory != null || _selectedTag.isNotEmpty) return;
+    final fresh = javdbMoviesNotInLocal(
+      movies,
+      _works.map((work) => work.codeKey),
+    );
+    if (fresh.isEmpty) return;
+    final extra = <ActressWork>[
+      for (final movie in fresh)
+        ActressWork(
+          id: 0,
+          personId: person.localId,
+          codeKey: movie.number,
+          titleKey: movie.number,
+          site: 'javdb',
+          codeDisplay: movie.number,
+          title: movie.title,
+          date: movie.releaseDate,
+          coverSource: 'javdb',
+          coverUrl: movie.poster,
+        ),
+    ];
+    setState(() {
+      _works = [..._works, ...extra];
+      _javdbWorksCount = extra.length;
       _filteredTotal += extra.length;
       _headerTotal = _filteredTotal;
       _hasMore = _works.length < _filteredTotal;

@@ -16,7 +16,11 @@ import '../detail_screen.dart';
 import '../local_store.dart';
 import '../models.dart';
 import 'actress_av_style.dart';
+import 'actress_database.dart';
+import 'actress_detail_page.dart';
+import 'actress_models.dart';
 import 'actress_online_detail.dart';
+import 'javdb_actress_merge.dart';
 import 'javdb_api.dart';
 import 'javdb_image.dart';
 
@@ -95,12 +99,17 @@ class JavdbSourceView extends StatefulWidget {
     this.client,
     this.repository,
     this.store,
+    this.database,
   });
 
   final String initialQuery;
   final JavdbApiClient? client;
   final AppRepository? repository;
   final LocalStore? store;
+
+  /// 本地女优库（合并用）：传了才做「本地库已有」标记与演员页
+  /// 合并；不传时整条 JavDB 源照旧独立显示。
+  final ActressDatabase? database;
 
   @override
   State<JavdbSourceView> createState() => _JavdbSourceViewState();
@@ -115,6 +124,10 @@ class _JavdbSourceViewState extends State<JavdbSourceView> {
   String _error = '';
   int _page = 1;
   bool _loadingMore = false;
+
+  /// 本地库里已有同名女优的 JavDB 演员 id（卡片打「本地库」
+  /// 标记用）；database 没传时恒空。
+  Set<String> _localActorIds = const {};
 
   String get _query => widget.initialQuery.trim();
 
@@ -150,6 +163,7 @@ class _JavdbSourceViewState extends State<JavdbSourceView> {
           _loading = false;
           _loadingMore = false;
         });
+        unawaited(_resolveLocalActors());
       } else if (_tab == 1) {
         final rows = await _client.latestMovies(page: _page);
         if (!mounted) return;
@@ -178,6 +192,20 @@ class _JavdbSourceViewState extends State<JavdbSourceView> {
               : 'JavDB 暂时连不上，请检查网络后重试';
         }
       });
+    }
+  }
+
+  /// 演员列表到位后查本地库同名女优（归一化名字口径），命中
+  /// 的卡片打「本地库」标记。查库失败不影响 JavDB 列表本身。
+  Future<void> _resolveLocalActors() async {
+    final db = widget.database;
+    if (db == null || _actors.isEmpty) return;
+    try {
+      final hits = await javdbActorIdsPresentLocally(db, _actors);
+      if (!mounted) return;
+      setState(() => _localActorIds = hits);
+    } catch (_) {
+      // 本地库查不到就不打标记，不堵在线列表。
     }
   }
 
@@ -338,6 +366,7 @@ class _JavdbSourceViewState extends State<JavdbSourceView> {
   }
 
   Widget _actorCard(JavdbActor actor) {
+    final inLocal = _localActorIds.contains(actor.id);
     return InkWell(
       key: ValueKey('javdb-actor-${actor.id}'),
       onTap: () => Navigator.of(context).push(
@@ -347,6 +376,7 @@ class _JavdbSourceViewState extends State<JavdbSourceView> {
             client: _client,
             repository: widget.repository,
             store: widget.store,
+            database: widget.database,
           ),
         ),
       ),
@@ -370,6 +400,24 @@ class _JavdbSourceViewState extends State<JavdbSourceView> {
               color: AvStyle.text,
             ),
           ),
+          // 本地库已有同名女优：明示标记，点进去是合并后的作品。
+          if (inLocal)
+            Container(
+              margin: const EdgeInsets.only(top: 3),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+              decoration: BoxDecoration(
+                color: AvStyle.green,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: const Text(
+                '本地库',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
         ],
       ),
     );
@@ -464,6 +512,10 @@ class _JavdbSourceViewState extends State<JavdbSourceView> {
 }
 
 /// JavDB 演员页：大头像 + 名字 + 作品网格（版式同女优详情）。
+/// 传了本地库（database）时按归一化名字匹配本地库女优，作品
+/// 列表合并：本地库作品在前（点开走本地女优页、播放优先本地
+/// 库线路）、JavDB 作品按归一番号去重后补在后面（2026-11-27
+/// 问题 2 合并令）。
 class JavdbActorPage extends StatefulWidget {
   const JavdbActorPage({
     super.key,
@@ -471,12 +523,14 @@ class JavdbActorPage extends StatefulWidget {
     this.client,
     this.repository,
     this.store,
+    this.database,
   });
 
   final JavdbActor actor;
   final JavdbApiClient? client;
   final AppRepository? repository;
   final LocalStore? store;
+  final ActressDatabase? database;
 
   @override
   State<JavdbActorPage> createState() => _JavdbActorPageState();
@@ -487,6 +541,17 @@ class _JavdbActorPageState extends State<JavdbActorPage> {
   List<JavdbMovie> _movies = const [];
   bool _loading = true;
   String _error = '';
+
+  /// 本地库同名女优与其作品（合并用）；没匹配上时 person 为空。
+  ActressPerson? _localPerson;
+  List<ActressWork> _localWorks = const [];
+
+  /// 合并后的 JavDB 侧作品：与本地库同番号的剔除（只留本地
+  /// 库那条，播放优先本地库线路）。
+  List<JavdbMovie> get _mergedMovies => javdbMoviesNotInLocal(
+    _movies,
+    _localWorks.map((work) => work.codeKey),
+  );
 
   @override
   void initState() {
@@ -506,6 +571,7 @@ class _JavdbActorPageState extends State<JavdbActorPage> {
         _movies = rows;
         _loading = false;
       });
+      unawaited(_loadLocalMerge());
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -513,6 +579,55 @@ class _JavdbActorPageState extends State<JavdbActorPage> {
         _error = error is AppFailure ? error.message : '作品暂时拉不到，请稍后再试';
       });
     }
+  }
+
+  /// 本地库合并：按归一化名字找同名女优，拉她的全部本地作品。
+  /// 查不到/查失败就保持纯 JavDB 列表，不堵页面。
+  Future<void> _loadLocalMerge() async {
+    final db = widget.database;
+    if (db == null) return;
+    try {
+      final person = await findLocalActressByName(db, widget.actor.name);
+      if (person == null || !mounted) return;
+      final total = await db.countWorks(person.localId);
+      final works = total <= 0
+          ? const <ActressWork>[]
+          : await db.worksForPerson(
+              person.localId,
+              offset: 0,
+              limit: total.clamp(1, 3000),
+            );
+      if (!mounted) return;
+      setState(() {
+        _localPerson = person;
+        _localWorks = works;
+      });
+    } catch (_) {
+      // 本地库合并失败不影响 JavDB 作品本身。
+    }
+  }
+
+  /// 点本地库作品卡：去本地女优页（同一人的合并页，播放走
+  /// 本地库点播链）。
+  void _openLocalPerson() {
+    final person = _localPerson;
+    final repository = widget.repository;
+    final store = widget.store;
+    final db = widget.database;
+    if (person == null || repository == null || store == null || db == null) {
+      return;
+    }
+    Navigator.of(context).push(
+      appPageRoute(
+        builder: (_) => ActressDetailPage(
+          localId: person.localId,
+          repository: repository,
+          store: store,
+          database: db,
+          javdbClient: _client,
+        ),
+      ),
+    );
   }
 
   @override
@@ -557,9 +672,14 @@ class _JavdbActorPageState extends State<JavdbActorPage> {
                         ),
                       ),
                       const SizedBox(height: 6),
-                      // 部数只认接口实际返回（列表条数），不编。
+                      // 部数只认实际合并到的（本地库实际作品数 +
+                      // 去重后 JavDB 实际条数），不用站方声称数字。
                       Text(
-                        _loading ? '作品加载中…' : '${_movies.length} 部影片',
+                        _loading
+                            ? '作品加载中…'
+                            : _localPerson != null
+                            ? '本地库 ${_localWorks.length} 部 · JavDB ${_mergedMovies.length} 部'
+                            : '${_movies.length} 部影片',
                         style: const TextStyle(
                           color: AvStyle.dim,
                           fontSize: 13,
@@ -602,7 +722,9 @@ class _JavdbActorPageState extends State<JavdbActorPage> {
         ),
       );
     }
-    if (_movies.isEmpty) {
+    final movies = _mergedMovies;
+    final total = _localWorks.length + movies.length;
+    if (total == 0) {
       return const Center(
         child: Text('没有拿到作品数据', style: TextStyle(color: AvStyle.dim)),
       );
@@ -610,9 +732,36 @@ class _JavdbActorPageState extends State<JavdbActorPage> {
     return GridView.builder(
       padding: const EdgeInsets.fromLTRB(12, 6, 12, 16),
       gridDelegate: avWorkGridDelegate,
-      itemCount: _movies.length,
+      itemCount: total,
       itemBuilder: (context, index) {
-        final movie = _movies[index];
+        // 本地库作品在前（合并口径：本地优先），点开去本地
+        // 女优页走本地库点播链。
+        if (index < _localWorks.length) {
+          final work = _localWorks[index];
+          return AvWorkCard(
+            cover: work.coverUrl,
+            title: work.displayTitle,
+            code: work.codeDisplay.isNotEmpty ? work.codeDisplay : work.codeKey,
+            date: work.date,
+            onTap: _openLocalPerson,
+            topRight: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: AvStyle.green,
+                borderRadius: BorderRadius.circular(999),
+              ),
+              child: const Text(
+                '本地库',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 10,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          );
+        }
+        final movie = movies[index - _localWorks.length];
         return InkWell(
           onTap: () {
             final repository = widget.repository;

@@ -8,6 +8,7 @@ import 'package:flutter/services.dart';
 import 'actress_av_style.dart';
 import 'actress_database.dart';
 import 'actress_detail_page.dart';
+import 'javdb_api.dart';
 import 'actress_film_library.dart';
 import 'actress_generic_db.dart';
 import 'actress_json_fallback.dart';
@@ -1108,6 +1109,7 @@ class _ActressListPageState extends State<ActressListPage> {
           siteFilter: _source,
           initialTag: _videoTag,
           fallback: _fallback,
+          javdbClient: JavdbApiClient(),
         ),
       ),
     );
