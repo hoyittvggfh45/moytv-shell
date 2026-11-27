@@ -997,7 +997,10 @@ void main() {
       );
     });
 
-    test('不允许的站源直接跳过不预检', () async {
+    // 门禁删除后口径（2026-11-27 phonefix2）：未知/未登记
+    // 站源不再被准入跳过——探到的版本照常进竞速解析。
+    // 旧名「不允许的站源直接跳过不预检」，断言已反转。
+    test('未知站源不再被准入跳过、照常解析', () async {
       final probe = _ScriptedProbeService(
         repository: repository,
         results: {
@@ -1020,7 +1023,7 @@ void main() {
           ),
         },
       );
-      final blocked = ActressPlayChain(
+      final chain = ActressPlayChain(
         repository: repository,
         store: store,
         avId: 'SSIS-00123',
@@ -1029,10 +1032,10 @@ void main() {
         verifyFetch: _alwaysPlayable,
       );
       expect(
-        await blocked.nextPlayable(profileEpoch: store.profileEpoch),
-        isNull,
+        await chain.nextPlayable(profileEpoch: store.profileEpoch),
+        isNotNull,
       );
-      expect(repository.resolveCalls, isEmpty);
+      expect(repository.resolveCalls, ['drama-a']);
     });
 
     test('标题模式按标题搜并换线', () async {
