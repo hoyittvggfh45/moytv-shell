@@ -87,16 +87,17 @@ SharedJsonKind classifySharedJson(String text) {
 }
 
 /// 海阔导入：默认走 HaikuoStore.importBytes（与小程序页文件导入
-/// 同一入口）。不传 onDuplicates 时仓库默认同名两边都留
-/// （HaikuoDuplicateDecision.keepBoth），分享场景下不弹窗问。
+/// 同一入口），并显式传 onDuplicates 返回 replace：同名直接替换
+/// 旧规则（用户 2026-11-27 令），分享场景下不弹窗、不留 _2 副本。
 typedef HaikuoSharedJsonImportFn =
     Future<HaikuoImportResult> Function(List<int> bytes, String origin);
 
 /// 书源导入：默认走 NovelSourceStore.importJsonText（与阅读区
 /// 文件导入同一套 JSON 分支：单条与批量同一规则）。
 typedef LegadoSharedJsonImportFn =
-    Future<({List<NovelImportRecord> records, int skipped})>
-    Function(String text);
+    Future<({List<NovelImportRecord> records, int skipped})> Function(
+      String text,
+    );
 
 /// 配置导入：默认走 TvBoxImporter.importFromText（与导入中心
 /// 文件导入同一入口）。
@@ -126,7 +127,11 @@ class SharedJsonImportHandler {
     Future<void> Function()? onLegadoImported,
   }) : _haikuoImport =
            haikuoImport ??
-           ((bytes, origin) => HaikuoStore().importBytes(bytes, origin: origin)),
+           ((bytes, origin) => HaikuoStore().importBytes(
+             bytes,
+             origin: origin,
+             onDuplicates: (_) async => HaikuoDuplicateDecision.replace,
+           )),
        _legadoImport =
            legadoImport ?? ((text) => NovelSourceStore.importJsonText(text)),
        _configImport =
@@ -150,17 +155,13 @@ class SharedJsonImportHandler {
              if (targetStore == null || repo == null) {
                return '该文件是 TVBox 视频列表 JSON，请在站点列表右上角 + 号里选“导入本地文件”';
              }
-             final engine = ImportEngine(
-               store: targetStore,
-               repository: repo,
-             );
+             final engine = ImportEngine(store: targetStore, repository: repo);
              final report = await engine.importAll([
                ImportCandidate(name: fileName, bytes: bytes),
              ]);
              return report.summary;
            }),
-       _onLegadoImported =
-           onLegadoImported ?? NovelSourceStore.applyToRegistry;
+       _onLegadoImported = onLegadoImported ?? NovelSourceStore.applyToRegistry;
 
   final HaikuoSharedJsonImportFn _haikuoImport;
   final LegadoSharedJsonImportFn _legadoImport;
@@ -213,9 +214,7 @@ class SharedJsonImportHandler {
       case SharedJsonKind.haikuo:
         try {
           final result = await _haikuoImport(bytes, '分享：$fileName');
-          final notes = result.notes
-              .where((note) => note.isNotEmpty)
-              .toList();
+          final notes = result.notes.where((note) => note.isNotEmpty).toList();
           if (notes.isEmpty) return result.summary;
           final shown = notes.take(3).join('；');
           final rest = notes.length > 3 ? '，还有 ${notes.length - 3} 条' : '';

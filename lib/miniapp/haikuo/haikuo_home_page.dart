@@ -13,45 +13,6 @@ import 'haikuo_runner_page.dart';
 import 'haikuo_store.dart';
 import 'haikuo_zip_import.dart';
 
-/// 导入时发现同名站点，问用户怎么处理：替换旧的 / 保留两者
-/// （新导入的改名 _2）/ 取消整批导入。点遮罩或返回键关掉也算取消。
-Future<HaikuoDuplicateDecision> showHaikuoDuplicateDialog(
-  BuildContext context,
-  List<HaikuoDuplicate> duplicates,
-) async {
-  if (duplicates.isEmpty) return HaikuoDuplicateDecision.cancel;
-  final names = duplicates.map((d) => d.incoming.name).toSet().toList();
-  final choice = await showDialog<HaikuoDuplicateDecision>(
-    context: context,
-    builder: (context) => AlertDialog(
-      title: const Text('发现同名站点'),
-      content: Text(
-        '以下站点已经存在：\n${names.join('、')}\n\n'
-        '替换会用新导入的覆盖旧的；保留两者会把新导入的改名'
-        '（如“${names.first}_2”）后留下；取消则这次什么都不导入。',
-      ),
-      actions: [
-        TextButton(
-          onPressed: () =>
-              Navigator.pop(context, HaikuoDuplicateDecision.cancel),
-          child: const Text('取消'),
-        ),
-        TextButton(
-          onPressed: () =>
-              Navigator.pop(context, HaikuoDuplicateDecision.keepBoth),
-          child: const Text('保留两者'),
-        ),
-        FilledButton(
-          onPressed: () =>
-              Navigator.pop(context, HaikuoDuplicateDecision.replace),
-          child: const Text('替换'),
-        ),
-      ],
-    ),
-  );
-  return choice ?? HaikuoDuplicateDecision.cancel;
-}
-
 /// 长按规则图标的官方操作表（主表）：9 项，顺序照官方海阔视界截图。
 const List<({String value, String label})> haikuoActionSheetItems = [
   (value: 'edit', label: '编辑规则'),
@@ -409,10 +370,12 @@ class _HaikuoHomePageState extends State<HaikuoHomePage>
     });
   }
 
+  /// 同名处理（用户 2026-11-27 令）：一律默认替换旧规则，
+  /// 不弹窗、不改名留副本。
   Future<HaikuoDuplicateDecision> _askDuplicates(
     List<HaikuoDuplicate> duplicates,
-  ) {
-    return showHaikuoDuplicateDialog(context, duplicates);
+  ) async {
+    return HaikuoDuplicateDecision.replace;
   }
 
   Future<void> _importFile() async {

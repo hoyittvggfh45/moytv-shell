@@ -130,10 +130,7 @@ void main() {
     setUp(() async {
       temp = await Directory.systemTemp.createTemp('haikuo-market-');
       store = HaikuoStore(rootOverride: temp);
-      service = HaikuoRuleMarketService(
-        store: store,
-        fetcher: _fakeFetcher(),
-      );
+      service = HaikuoRuleMarketService(store: store, fetcher: _fakeFetcher());
     });
 
     tearDown(() async {
@@ -171,10 +168,7 @@ void main() {
       );
       // 批量状态与逐条判定一致
       final states = await service.installStates(index);
-      expect(
-        states['🔞鉴黄师'],
-        HaikuoRuleInstallState.updateAvailable,
-      );
+      expect(states['🔞鉴黄师'], HaikuoRuleInstallState.updateAvailable);
       expect(states['测试站'], HaikuoRuleInstallState.notInstalled);
     });
 
@@ -211,6 +205,21 @@ void main() {
       expect(programs, hasLength(1));
       expect(programs.single.version, '16');
     });
+
+    test('同名不同内容安装不传 onDuplicates：默认替换且 id 挂回旧条目', () async {
+      final old = _rule('🔞鉴黄师', version: 15);
+      old['url'] = 'hiker://empty##https://example.com/old';
+      await store.importText(jsonEncode(old), origin: '测试');
+      final oldId = (await store.list()).single.id;
+      final index = await service.fetchIndex();
+      final result = await service.install(index.rules.first, index: index);
+      expect(result.updated, hasLength(1));
+      expect(result.added, isEmpty);
+      final programs = await store.list();
+      expect(programs, hasLength(1));
+      expect(programs.single.version, '16');
+      expect(programs.single.id, oldId);
+    });
   });
 
   group('市场区界面', () {
@@ -231,7 +240,9 @@ void main() {
       HaikuoRuleMarketService service,
     ) async {
       await tester.pumpWidget(
-        MaterialApp(home: Scaffold(body: HaikuoRuleMarketView(service: service))),
+        MaterialApp(
+          home: Scaffold(body: HaikuoRuleMarketView(service: service)),
+        ),
       );
       // 等假拉取与本地库读取完成（真时间轮询，不用 pumpAndSettle 死等）。
       for (var i = 0; i < 50; i++) {
@@ -246,9 +257,7 @@ void main() {
       }
     }
 
-    testWidgets('列表展示索引条目，点安装后本地库出现规则且按钮变已安装', (
-      tester,
-    ) async {
+    testWidgets('列表展示索引条目，点安装后本地库出现规则且按钮变已安装', (tester) async {
       final service = HaikuoRuleMarketService(
         store: store,
         fetcher: _fakeFetcher(),
@@ -268,6 +277,37 @@ void main() {
       expect(find.text('已安装'), findsOneWidget);
       final programs = await tester.runAsync(() => store.list());
       expect(programs!.map((p) => p.name), contains('🔞鉴黄师'));
+    });
+
+    testWidgets('同名旧版点更新：不弹同名框，直接替换且 id 不变', (tester) async {
+      // 先装一份同名但内容不同（id 不同）的旧版，市场里应显示「更新」。
+      final old = _rule('🔞鉴黄师', version: 15);
+      old['url'] = 'hiker://empty##https://example.com/old';
+      await tester.runAsync(
+        () => store.importText(jsonEncode(old), origin: '测试'),
+      );
+      final oldId = (await tester.runAsync(() => store.list()))!.single.id;
+      final service = HaikuoRuleMarketService(
+        store: store,
+        fetcher: _fakeFetcher(),
+      );
+      // 不传 onDuplicates：走页面默认口径（默认替换）。
+      await pumpView(tester, service);
+      expect(find.text('更新'), findsOneWidget);
+      await tester.tap(find.widgetWithText(FilledButton, '更新'));
+      for (var i = 0; i < 50; i++) {
+        await tester.runAsync(
+          () => Future<void>.delayed(const Duration(milliseconds: 100)),
+        );
+        await tester.pump(const Duration(milliseconds: 50));
+        if (find.text('已安装').evaluate().isNotEmpty) break;
+      }
+      expect(find.text('发现同名站点'), findsNothing);
+      expect(find.text('已安装'), findsOneWidget);
+      final programs = await tester.runAsync(() => store.list());
+      expect(programs, hasLength(1));
+      expect(programs!.single.version, '16');
+      expect(programs.single.id, oldId);
     });
 
     testWidgets('索引拉取失败显示诚实空态与重试', (tester) async {

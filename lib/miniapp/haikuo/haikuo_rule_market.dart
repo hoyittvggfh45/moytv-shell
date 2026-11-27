@@ -5,7 +5,6 @@ import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import 'haikuo_helpers.dart';
-import 'haikuo_home_page.dart';
 import 'haikuo_program.dart';
 import 'haikuo_store.dart';
 
@@ -275,9 +274,9 @@ class HaikuoRuleMarketService {
 
   /// 下载单条规则并走海阔既有导入链路装入本地库。
   ///
-  /// 同名处理完全沿用既有导入口径：由调用方传 [onDuplicates]
-  ///（页面层传 `showHaikuoDuplicateDialog`），不传时按
-  /// [HaikuoStore.addAll] 默认口径保留两者，不静默覆盖。
+  /// 同名处理：由调用方传 [onDuplicates] 决定，不传时按
+  /// [HaikuoStore.addAll] 默认口径直接替换旧规则（用户
+  /// 2026-11-27 令：海阔规则更新默认替换）。
   Future<HaikuoImportResult> install(
     HaikuoRuleIndexEntry entry, {
     required HaikuoRuleIndex index,
@@ -303,8 +302,8 @@ class HaikuoRuleMarketView extends StatefulWidget {
   /// 测试注入假服务；生产环境为空，现建默认服务。
   final HaikuoRuleMarketService? service;
 
-  /// 同名规则处理回调（测试可注入）；为空时用既有同名弹窗
-  /// [showHaikuoDuplicateDialog]。
+  /// 同名规则处理回调（测试可注入）；为空时默认直接替换旧规则
+  /// （用户 2026-11-27 令），不弹窗。
   final Future<HaikuoDuplicateDecision> Function(
     BuildContext context,
     List<HaikuoDuplicate> duplicates,
@@ -363,10 +362,11 @@ class _HaikuoRuleMarketViewState extends State<HaikuoRuleMarketView> {
 
   Future<HaikuoDuplicateDecision> _askDuplicates(
     List<HaikuoDuplicate> duplicates,
-  ) {
+  ) async {
     final handler = widget.onDuplicates;
     if (handler != null) return handler(context, duplicates);
-    return showHaikuoDuplicateDialog(context, duplicates);
+    // 默认替换（用户 2026-11-27 令）：不弹窗、不改名留副本。
+    return HaikuoDuplicateDecision.replace;
   }
 
   Future<void> _install(HaikuoRuleIndexEntry entry) async {

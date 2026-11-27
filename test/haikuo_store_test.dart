@@ -91,8 +91,9 @@ void main() {
     'find_rule': 'js:\nsetResult([{title: "$marker"}]);',
   };
 
-  test('同名不同内容：选替换则覆盖旧的，只留一份', () async {
+  test('同名不同内容：选替换则覆盖旧的，只留一份且 id 挂回旧条目', () async {
     await store.importText(jsonEncode(ruleVersion('同名', 'v1')));
+    final oldId = (await store.list()).single.id;
     final seen = <HaikuoDuplicate>[];
     final result = await store.importText(
       jsonEncode(ruleVersion('同名', 'v2')),
@@ -110,6 +111,9 @@ void main() {
     expect(programs, hasLength(1));
     expect(programs.single.name, '同名');
     expect(programs.single.rawJson, contains('v2'));
+    // 替换后登记保持同一条：id 还是旧条目的 id，不是按新内容算的 id。
+    expect(programs.single.id, oldId);
+    expect(result.updated.single.id, oldId);
   });
 
   test('同名不同内容：选保留两者则新条目改名 _2，旧的不动', () async {
@@ -123,19 +127,17 @@ void main() {
     expect(programs.map((p) => p.name).toSet(), {'同名', '同名_2'});
     final kept = programs.firstWhere((p) => p.name == '同名_2');
     expect(kept.rawJson, contains('v2'));
-    expect(
-      programs.firstWhere((p) => p.name == '同名').rawJson,
-      contains('v1'),
-    );
+    expect(programs.firstWhere((p) => p.name == '同名').rawJson, contains('v1'));
     // 再来一个同名新版：_2 已被占，顺延成 _3。
     await store.importText(
       jsonEncode(ruleVersion('同名', 'v3')),
       onDuplicates: (_) async => HaikuoDuplicateDecision.keepBoth,
     );
-    expect(
-      (await store.list()).map((p) => p.name).toSet(),
-      {'同名', '同名_2', '同名_3'},
-    );
+    expect((await store.list()).map((p) => p.name).toSet(), {
+      '同名',
+      '同名_2',
+      '同名_3',
+    });
   });
 
   test('同名不同内容：选取消则整批都不导入', () async {
@@ -152,12 +154,35 @@ void main() {
     expect(programs.single.rawJson, contains('v1'));
   });
 
-  test('同名不同内容：不传回调时默认保留两者', () async {
+  test('同名不同内容：不传回调时默认替换（用户令），不留 _2、id 不变', () async {
     await store.importText(jsonEncode(ruleVersion('同名', 'v1')));
+    final oldId = (await store.list()).single.id;
+    final result = await store.importText(jsonEncode(ruleVersion('同名', 'v2')));
+    expect(result.updated, hasLength(1));
+    expect(result.added, isEmpty);
+    final programs = await store.list();
+    expect(programs, hasLength(1));
+    expect(programs.single.name, '同名');
+    expect(programs.single.rawJson, contains('v2'));
+    expect(programs.single.id, oldId);
+  });
+
+  test('替换后按名挂钩的收藏不受影响', () async {
+    await store.importText(jsonEncode(ruleVersion('同名', 'v1')));
+    await store.toggleFavorite({
+      'rule': '同名',
+      'url': 'https://example.com/work/1',
+      'title': '收藏的一部',
+    });
     await store.importText(jsonEncode(ruleVersion('同名', 'v2')));
+    final favorites = await store.listFavorites();
+    expect(favorites, hasLength(1));
+    expect(favorites.single['title'], '收藏的一部');
+    final scoped = await store.listFavorites(rule: '同名');
+    expect(scoped, hasLength(1));
     expect(
-      (await store.list()).map((p) => p.name).toSet(),
-      {'同名', '同名_2'},
+      await store.isFavorite(rule: '同名', url: 'https://example.com/work/1'),
+      isTrue,
     );
   });
 

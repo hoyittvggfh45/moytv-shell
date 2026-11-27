@@ -1,8 +1,11 @@
 import 'dart:convert';
+import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:moyi/external_py_import.dart';
 import 'package:moyi/miniapp/haikuo/haikuo_program.dart';
+import 'package:moyi/miniapp/haikuo/haikuo_store.dart';
 import 'package:moyi/novel_source_store.dart';
 import 'package:moyi/plugin_share_intent.dart';
 import 'package:moyi/shared_json_import.dart';
@@ -29,6 +32,8 @@ NovelImportRecord _record(String name) =>
     NovelImportRecord(id: 'novel_1', name: name, fileName: 'f.json');
 
 void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
   group('分享 JSON 内容判定', () {
     test('单个海阔规则对象', () {
       expect(classifySharedJson(_ruleJson), SharedJsonKind.haikuo);
@@ -58,7 +63,9 @@ void main() {
 
     test('TVBox 配置只有 sites 也认', () {
       expect(
-        classifySharedJson('{"sites":[{"key":"a","name":"A","api":"http://x"}]}'),
+        classifySharedJson(
+          '{"sites":[{"key":"a","name":"A","api":"http://x"}]}',
+        ),
         SharedJsonKind.tvboxConfig,
       );
     });
@@ -100,7 +107,10 @@ void main() {
     });
 
     test('无关 JSON 数组', () {
-      expect(classifySharedJson('[{"a":1},{"b":2}]'), SharedJsonKind.unsupported);
+      expect(
+        classifySharedJson('[{"a":1},{"b":2}]'),
+        SharedJsonKind.unsupported,
+      );
     });
 
     test('空内容与坏 JSON', () {
@@ -172,10 +182,8 @@ void main() {
 
     test('书源批量返回条数与跳过数', () async {
       final handler = SharedJsonImportHandler(
-        legadoImport: (_) async => (
-          records: [_record('甲'), _record('乙')],
-          skipped: 1,
-        ),
+        legadoImport: (_) async =>
+            (records: [_record('甲'), _record('乙')], skipped: 1),
         onLegadoImported: () async {},
       );
       final message = await handler.handle(
@@ -287,6 +295,51 @@ void main() {
       expect(called, isFalse);
       expect(message, contains('不是可识别的 JSON'));
       expect(message, contains('weird.json'));
+    });
+  });
+
+  group('分享导入海阔默认接线（同名默认替换）', () {
+    late Directory temp;
+
+    setUp(() {
+      temp = Directory.systemTemp.createTempSync('shared-haikuo-');
+      // path_provider 指到临时目录，默认 HaikuoStore() 落在这里。
+      const channel = MethodChannel('plugins.flutter.io/path_provider');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, (call) async {
+            if (call.method == 'getApplicationDocumentsDirectory' ||
+                call.method == 'getApplicationSupportDirectory') {
+              return temp.path;
+            }
+            return null;
+          });
+    });
+
+    tearDown(() async {
+      const channel = MethodChannel('plugins.flutter.io/path_provider');
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(channel, null);
+      if (await temp.exists()) await temp.delete(recursive: true);
+    });
+
+    test('分享进来的同名新版直接替换旧规则，不留 _2、id 不变', () async {
+      final store = HaikuoStore();
+      await store.importText(_ruleJson, origin: '测试');
+      final oldId = (await store.list()).single.id;
+      // 同名但内容不同（find_rule 变了 → 按内容算的 id 不同）。
+      const changed =
+          '{"title":"测试规则","find_rule":"js:var a=2;setResult(d)","search_url":"https://example.com/s?wd=**"}';
+      final handler = SharedJsonImportHandler();
+      final message = await handler.handle(
+        utf8.encode(changed),
+        fileName: 'rule.json',
+      );
+      expect(message, contains('更新 1 个'));
+      final programs = await HaikuoStore().list();
+      expect(programs, hasLength(1));
+      expect(programs.single.name, '测试规则');
+      expect(programs.single.rawJson, contains('var a=2'));
+      expect(programs.single.id, oldId);
     });
   });
 

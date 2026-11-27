@@ -98,9 +98,11 @@ class HaikuoStore {
   /// 把一批小程序写进本地库。
   ///
   /// 同 id（同名同内容）重复导入只更新，不堆叠；新 id 但与库里已有条目
-  /// 同名时属于重复：经 [onDuplicates] 问用户一次（替换 / 保留两者 /
-  /// 取消），不传 [onDuplicates] 时默认保留两者（新条目改名 _2、_3…）。
-  /// 选取消则整批都不写入。
+  /// 同名时属于重复：经 [onDuplicates] 决定一次（替换 / 保留两者 /
+  /// 取消），不传 [onDuplicates] 时默认替换（用户 2026-11-27 令：
+  /// 海阔规则更新默认替换，不弹窗、不改名留副本）。替换时新条目挂回
+  /// 旧条目的 id 入库，登记保持同一条；按名挂钩的收藏/历史等状态
+  /// 因名字不变天然保留。选取消则整批都不写入。
   Future<HaikuoImportResult> addAll(
     List<HaikuoProgram> incoming, {
     String origin = '',
@@ -147,7 +149,7 @@ class HaikuoStore {
       final effective = byDuplicateName.values.toList();
       final decision =
           await onDuplicates?.call(effective) ??
-          HaikuoDuplicateDecision.keepBoth;
+          HaikuoDuplicateDecision.replace;
       switch (decision) {
         case HaikuoDuplicateDecision.cancel:
           return HaikuoImportResult(
@@ -158,7 +160,11 @@ class HaikuoStore {
           );
         case HaikuoDuplicateDecision.replace:
           for (final duplicate in effective) {
-            final tagged = duplicate.incoming;
+            // 新条目挂回旧条目的 id：登记保持同一条，与同 id 更新
+            // 路径语义一致（除 id 外其余字段全用新条目的）。
+            final tagged = duplicate.incoming.copyWith(
+              id: duplicate.existing.id,
+            );
             // 按名字清掉全部同名旧项（含旧逻辑无提示堆出的重复项），
             // 只留新导入的这一份。
             byId.removeWhere(

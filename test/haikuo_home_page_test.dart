@@ -2,7 +2,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:moyi/miniapp/haikuo/haikuo_clipboard.dart';
 import 'package:moyi/miniapp/haikuo/haikuo_home_page.dart';
 import 'package:moyi/miniapp/haikuo/haikuo_program.dart';
 import 'package:moyi/miniapp/haikuo/haikuo_store.dart';
@@ -185,69 +187,72 @@ void main() {
     expect(find.text('详情'), findsNothing);
   });
 
-  Future<HaikuoDuplicateDecision?> pumpDuplicateDialog(
-    WidgetTester tester,
-    String choice,
-  ) async {
-    HaikuoDuplicateDecision? result;
+  testWidgets('剪贴板导入同名规则：不弹同名框，直接替换且 id 不变', (tester) async {
+    Map<String, dynamic> rule(String marker) => {
+      'title': '同名站',
+      'type': 'video',
+      'url': 'hiker://empty##https://example.com/同名站',
+      'col_type': 'movie_3',
+      'find_rule': 'js:\nsetResult([{title: "$marker"}]);',
+    };
+    await tester.runAsync(
+      () => store.importText(jsonEncode(rule('v1')), origin: '测试'),
+    );
+    final oldId = (await tester.runAsync(() => store.list()))!.single.id;
+
+    // 剪贴板里放同名新版规则 JSON（整段 JSON 算一个候选）。
+    final v2Text = jsonEncode(rule('v2'));
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(SystemChannels.platform, (call) async {
+          if (call.method == 'Clipboard.getData') return {'text': v2Text};
+          return null;
+        });
+    addTearDown(
+      () => TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(SystemChannels.platform, null),
+    );
+
+    tester.view.physicalSize = const Size(900, 1600);
+    tester.view.devicePixelRatio = 1.0;
+    addTearDown(tester.view.resetPhysicalSize);
+    addTearDown(tester.view.resetDevicePixelRatio);
     await tester.pumpWidget(
       MaterialApp(
-        home: Builder(
-          builder: (context) => Scaffold(
-            body: TextButton(
-              onPressed: () async {
-                result = await showHaikuoDuplicateDialog(context, [
-                  HaikuoDuplicate(
-                    incoming: const HaikuoProgram(id: 'new', name: '同名站'),
-                    existing: const HaikuoProgram(id: 'old', name: '同名站'),
-                  ),
-                ]);
-              },
-              child: const Text('问'),
-            ),
-          ),
+        home: HaikuoHomePage(
+          store: store,
+          clipboardSeenStore: InMemoryHaikuoClipboardSeenStore(),
         ),
       ),
     );
-    await tester.tap(find.text('问'));
-    await tester.pumpAndSettle();
-    expect(find.text('发现同名站点'), findsOneWidget);
-    expect(find.textContaining('同名站'), findsWidgets);
-    expect(find.textContaining('同名站_2'), findsOneWidget);
-    if (choice == 'dismiss') {
-      await tester.tapAt(const Offset(10, 10));
-    } else {
-      await tester.tap(find.text(choice));
+    // 等剪贴板检测弹出温馨提示（真时间轮询，不死等 pumpAndSettle）。
+    for (var i = 0; i < 50; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 100)),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+      if (find.text('温馨提示').evaluate().isNotEmpty) break;
     }
-    await tester.pumpAndSettle();
-    return result;
-  }
-
-  testWidgets('重复提示：选替换返回 replace', (tester) async {
-    expect(
-      await pumpDuplicateDialog(tester, '替换'),
-      HaikuoDuplicateDecision.replace,
-    );
-  });
-
-  testWidgets('重复提示：选保留两者返回 keepBoth', (tester) async {
-    expect(
-      await pumpDuplicateDialog(tester, '保留两者'),
-      HaikuoDuplicateDecision.keepBoth,
-    );
-  });
-
-  testWidgets('重复提示：选取消返回 cancel', (tester) async {
-    expect(
-      await pumpDuplicateDialog(tester, '取消'),
-      HaikuoDuplicateDecision.cancel,
-    );
-  });
-
-  testWidgets('重复提示：点遮罩关掉也算取消', (tester) async {
-    expect(
-      await pumpDuplicateDialog(tester, 'dismiss'),
-      HaikuoDuplicateDecision.cancel,
-    );
+    expect(find.text('温馨提示'), findsOneWidget);
+    expect(find.text('发现同名站点'), findsNothing);
+    await tester.tap(find.text('立即导入'));
+    // 等导入落盘：库里变成 v2 内容，且全程没有同名弹窗。
+    List<HaikuoProgram>? programs;
+    for (var i = 0; i < 50; i++) {
+      await tester.runAsync(
+        () => Future<void>.delayed(const Duration(milliseconds: 100)),
+      );
+      await tester.pump(const Duration(milliseconds: 50));
+      programs = await tester.runAsync(() => store.list());
+      if (programs != null &&
+          programs.length == 1 &&
+          programs.single.rawJson.contains('v2')) {
+        break;
+      }
+    }
+    expect(find.text('发现同名站点'), findsNothing);
+    expect(programs, hasLength(1));
+    expect(programs!.single.name, '同名站');
+    expect(programs.single.rawJson, contains('v2'));
+    expect(programs.single.id, oldId);
   });
 }
