@@ -1237,6 +1237,18 @@ class IdjPluginTabState extends State<IdjPluginTab> {
                           color: colors.onSurfaceVariant,
                         ),
                       ),
+                      // 显式总数（2026-11-27 问题 4）：用户实报
+                      // 「插件怎么才 38 个」——列表条数必须一眼
+                      // 可数，远端多少条这里就写多少条，少了
+                      // 当场看得出来，不靠手数卡片。
+                      if (subscription.plugins.isNotEmpty)
+                        Text(
+                          '共 ${subscription.plugins.length} 个插件',
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: colors.onSurfaceVariant,
+                          ),
+                        ),
                     ],
                   ),
                 ),
