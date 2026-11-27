@@ -33,6 +33,9 @@ class _FakeSource implements ContentSource {
   String get note => '';
 
   @override
+  bool get stationGated => false;
+
+  @override
   Future<List<ContentCategory>> categories() async => const [];
 
   @override

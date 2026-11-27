@@ -6,6 +6,7 @@ import 'package:flutter/services.dart' show rootBundle;
 import 'content_models.dart';
 import 'core_bridge.dart';
 import 'import_file_store.dart';
+import 'station_library.dart';
 
 class LegadoJsonInfo {
   const LegadoJsonInfo({
@@ -204,6 +205,13 @@ class JsonContentSource extends ContentSource {
 
   bool get isComic => sourceType == 2;
 
+  /// 内置 legado 书源归站点库管：代码在「魔蚁站点.sql」里，
+  /// 没导入只有名单、取不到 JSON。外部导入的同名形态不归它管。
+  @override
+  bool get stationGated =>
+      importedFileName.isEmpty &&
+      assetPath.startsWith(stationLegadoAssetPrefix);
+
   @override
   String get note => importedFileName.isNotEmpty
       ? '导入 JSON 书源'
@@ -214,8 +222,21 @@ class JsonContentSource extends ContentSource {
   static final _repository = NativeRepository();
 
   String? _json;
+  int _jsonGeneration = -1;
 
   Future<String> _sourceJson() async {
+    if (stationGated) {
+      // 站点库代次变了（导入/删除/回退）旧缓存立刻作废。
+      await StationLibrary.ensureLoaded();
+      final generation = StationLibrary.generation.value;
+      final cached = _json;
+      if (cached != null && _jsonGeneration == generation) return cached;
+      final text = StationLibrary.contentOf(id);
+      if (text == null) throw AppFailure(stationLibraryLockedMessage);
+      _json = text;
+      _jsonGeneration = generation;
+      return text;
+    }
     final cached = _json;
     if (cached != null) return cached;
     String text;

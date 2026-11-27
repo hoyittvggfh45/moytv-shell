@@ -3,6 +3,9 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import 'actress/actress_database.dart';
+import 'actress/actress_db_manage_page.dart';
+import 'actress/actress_working_db.dart';
 import 'app_page_route.dart';
 
 import 'audio_history_screen.dart';
@@ -17,6 +20,7 @@ import 'novel_source_store.dart';
 import 'reading_bookshelf_screen.dart';
 import 'site_icon.dart';
 import 'source_picker_sheet.dart';
+import 'station_library.dart';
 
 /// 听书 / 漫画 / 小说共用的分区页：源切换 + 分类 + 搜索 + 卡片列表，
 /// 文件夹卡走下钻栈（与影视区文件夹通道同一交互口径）。
@@ -82,12 +86,29 @@ class _ContentZoneScreenState extends State<ContentZoneScreen> {
   void initState() {
     super.initState();
     _binding = widget.binding ?? ContentZoneBinding();
+    // 站点库状态（导入/删除/回退）变了就重绑当前区：名单行
+    // 的锁定标记与引导面板跟着新状态走，不用重启 App。
+    StationLibrary.generation.addListener(_onStationLibraryChanged);
+    unawaited(StationLibrary.ensureLoaded());
     if (widget.section == ContentSection.novel) {
       _loadNovelSources();
     } else {
       _bindSection();
     }
   }
+
+  void _onStationLibraryChanged() {
+    if (!mounted) return;
+    setState(() {});
+    final source = _source;
+    if (source != null && source.stationGated) {
+      unawaited(_loadCategoriesWithAutoRetry());
+    }
+  }
+
+  /// 这个源归站点库管、且站点库还没给到它：名单行在、点不开。
+  bool _stationLocked(ContentSource source) =>
+      source.stationGated && !StationLibrary.provides(source.id);
 
   Future<void> _loadNovelSources() async {
     await NovelSourceStore.applyToRegistry();
@@ -163,6 +184,7 @@ class _ContentZoneScreenState extends State<ContentZoneScreen> {
 
   @override
   void dispose() {
+    StationLibrary.generation.removeListener(_onStationLibraryChanged);
     _cancelRetryDelay();
     _searchController.dispose();
     _scroll.dispose();
@@ -172,6 +194,16 @@ class _ContentZoneScreenState extends State<ContentZoneScreen> {
   Future<void> _loadCategories() async {
     final source = _source;
     if (source == null) return;
+    if (_stationLocked(source)) {
+      // 未导入站点库：不发注定失败的取数，界面直接出导入引导。
+      setState(() {
+        _loading = false;
+        _error = '';
+        _categories = const [];
+        _items = const [];
+      });
+      return;
+    }
     setState(() {
       _loading = true;
       _error = '';
@@ -267,7 +299,12 @@ class _ContentZoneScreenState extends State<ContentZoneScreen> {
           title: '',
           entries: [
             for (final source in _sources)
-              SourcePickerEntry(id: source.id, name: source.name),
+              SourcePickerEntry(
+                id: source.id,
+                name: _stationLocked(source)
+                    ? '${source.name}（未导入站点库）'
+                    : source.name,
+              ),
           ],
         ),
       ],
@@ -417,7 +454,11 @@ class _ContentZoneScreenState extends State<ContentZoneScreen> {
                   for (final source in visibleBuiltins)
                     ListTile(
                       title: Text(source.name),
-                      subtitle: Text(_builtinSubtitle(source)),
+                      subtitle: Text(
+                        _stationLocked(source)
+                            ? '${_builtinSubtitle(source)} · 未导入站点库'
+                            : _builtinSubtitle(source),
+                      ),
                       trailing: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
@@ -694,7 +735,103 @@ class _ContentZoneScreenState extends State<ContentZoneScreen> {
     );
   }
 
+  Future<void> _importStationLibrary() async {
+    final core = await StationLibrary.currentCoreVersion();
+    final result = await StationLibrary.pickAndImport(
+      manifestIds: ContentRegistry.stationLibraryManifestIds,
+      currentCoreVersion: core,
+    );
+    if (!mounted) return;
+    if (result.ok) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('站点库已导入（共 ${result.itemCount} 条）')),
+      );
+      // generation 监听会重绑；这里再显式刷一次保证引导立刻退场。
+      setState(() {});
+      final source = _source;
+      if (source != null && source.stationGated) {
+        unawaited(_loadCategoriesWithAutoRetry());
+      }
+    } else if (!result.cancelled && result.error != null) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(result.error!)));
+    }
+  }
+
+  Future<void> _openStationDbManage() async {
+    final db = SqfliteActressDatabase.instance;
+    final dbPath = await actressWorkingDbPath();
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      appPageRoute(
+        builder: (_) => ActressDbManagePage(
+          dbPath: dbPath,
+          closeDatabase: db.close,
+          reloadDatabase: () async {
+            await db.reloadIfChanged();
+          },
+        ),
+      ),
+    );
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  /// 未导入站点库时的引导（照演员库新装空态样板：说清现状 +
+  /// 主按钮直接导入 + 次按钮去数据库管理页的站点库区）。
+  Widget _stationGuide(ColorScheme colors) {
+    final source = _source!;
+    return Center(
+      key: const ValueKey('station-library-guide'),
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(
+              Icons.cloud_download_outlined,
+              size: 44,
+              color: colors.onSurfaceVariant,
+            ),
+            const SizedBox(height: 12),
+            Text(
+              '「${source.name}」的代码在站点库里，还没导入',
+              textAlign: TextAlign.center,
+              style: const TextStyle(fontSize: 15),
+            ),
+            const SizedBox(height: 8),
+            Text(
+              '这类站包里只留名单，代码装在「魔蚁站点.sql」站点库里。'
+              '导入一次，名单里的站就都能用了；删掉站点库它们会回到'
+              '只有名单的状态。',
+              textAlign: TextAlign.center,
+              style: TextStyle(color: colors.onSurfaceVariant, fontSize: 13),
+            ),
+            const SizedBox(height: 16),
+            FilledButton.icon(
+              key: const ValueKey('station-library-import'),
+              onPressed: _importStationLibrary,
+              icon: const Icon(Icons.file_upload_outlined),
+              label: const Text('导入站点库'),
+            ),
+            const SizedBox(height: 8),
+            OutlinedButton(
+              key: const ValueKey('station-library-manage'),
+              onPressed: _openStationDbManage,
+              child: const Text('去数据库管理'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _body(ColorScheme colors) {
+    final source = _source;
+    if (source != null && _stationLocked(source)) {
+      return _stationGuide(colors);
+    }
     if (_loading) return const Center(child: CircularProgressIndicator());
     if (_error.isNotEmpty) {
       return Center(

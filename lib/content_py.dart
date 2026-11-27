@@ -1,9 +1,12 @@
+import 'dart:convert';
+
 import 'package:flutter/services.dart' show rootBundle;
 
 import 'content_models.dart';
 import 'core_bridge.dart';
 import 'import_file_store.dart';
 import 'py_bridge.dart';
+import 'station_library.dart';
 
 List<ContentChapter> parsePyPlayUrl(String playFrom, String playUrl) {
   final flags = playFrom.split(r'$$$');
@@ -79,11 +82,27 @@ class PyContentSource extends ContentSource {
 
   String? _path;
   Future<String>? _pathFuture;
+  int _pathGeneration = -1;
+
+  /// 听读 py 蜘蛛归站点库管：代码在「魔蚁站点.sql」里，没导入
+  /// 只有名单、落不了盘。小说 py 与外部导入 py 不归它管。
+  @override
+  bool get stationGated =>
+      importedFileName.isEmpty &&
+      assetPath.startsWith(stationAudioPyAssetPrefix);
 
   @override
   String get note => importedFileName.isNotEmpty ? '导入 py 蜘蛛' : '';
 
   Future<String> _spiderPath() async {
+    // 站点库代次变了（导入/删除/回退）落盘副本立刻作废重落，
+    // 换库不用重启 App。
+    if (stationGated &&
+        _path != null &&
+        _pathGeneration != StationLibrary.generation.value) {
+      _path = null;
+      _pathFuture = null;
+    }
     final cached = _path;
     if (cached != null) return cached;
     final pending = _pathFuture;
@@ -105,6 +124,22 @@ class PyContentSource extends ContentSource {
     if (importedFileName.isNotEmpty) {
       final path = await ImportFileStore.pathOf(importedFileName);
       _path = path;
+      return path;
+    }
+    if (stationGated) {
+      // 字节来源从资产换成站点库行，下游落盘路径与现行内置
+      // 完全一致（imported_spiders/builtin_<id>.py）。
+      await StationLibrary.ensureLoaded();
+      final content = StationLibrary.contentOf(id);
+      if (content == null) throw AppFailure(stationLibraryLockedMessage);
+      final fileName = await ImportFileStore.save(
+        'builtin_$id',
+        'py',
+        utf8.encode(content),
+      );
+      final path = await ImportFileStore.pathOf(fileName);
+      _path = path;
+      _pathGeneration = StationLibrary.generation.value;
       return path;
     }
     final bytes = await rootBundle.load(assetPath);

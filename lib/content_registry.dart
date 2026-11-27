@@ -257,6 +257,17 @@ class ContentRegistry {
   static List<ContentSource> get novelJsonBuiltins =>
       List.unmodifiable(builtinLegadoSources);
 
+  /// 站点库名单（第一期）：包里只留这批站的登记（站名+分区），
+  /// 代码装在「魔蚁站点.sql」里走导入激活。导入器的名单门就
+  /// 认这份集合——库里出现集合外的站整单拒收。构成与生成器
+  /// gen_station_sql.py 的取数口径一致：全部内置 legado 书源
+  /// （101）+ 听读 py 蜘蛛（11）。
+  static Set<String> get stationLibraryManifestIds => {
+    for (final source in novelJsonBuiltins) source.id,
+    for (final source in _sources)
+      if (source is PyContentSource && source.stationGated) source.id,
+  };
+
   static Set<String> get hiddenLegadoIds => Set.unmodifiable(_hiddenLegadoIds);
 
   static Set<String> get removedLegadoIds =>

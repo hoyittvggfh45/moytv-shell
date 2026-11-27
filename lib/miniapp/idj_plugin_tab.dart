@@ -6,6 +6,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core_bridge.dart' show AppFailure;
 import '../idj_plugin_store.dart';
+import '../station_library.dart';
 
 /// 小程序内「插件」tab（设计 §4）：已安装 / 安装入口 / 订阅 / 更新检查
 /// 四区。只作 tab 内容，不独立导航、不注册路由。
@@ -505,6 +506,11 @@ class IdjPluginTabState extends State<IdjPluginTab> {
     if (widget.initialSubscriptions != null) {
       _subscriptions = widget.initialSubscriptions!;
     }
+    // 站点库同 id 去重（站点库优先）：订阅卡要知道某站是否已
+    // 由站点库提供，进页先把站点库状态读进来。
+    StationLibrary.ensureLoaded().then((_) {
+      if (mounted) setState(() {});
+    });
     _refreshAll();
   }
 
@@ -1360,7 +1366,13 @@ class IdjPluginTabState extends State<IdjPluginTab> {
         IdjPluginManifest.compareVersions(plugin.version, installedVersion) >
             0;
     final installing = _installingIds.contains(plugin.id);
-    final actionLabel = installed == null
+    // 同 id 去重钉死「站点库优先」：这个站已由站点库提供时，
+    // 订阅卡不再让装插件版（装上也是两份同 id 代码并存）。
+    final providedByStationLibrary =
+        installed == null && StationLibrary.provides(plugin.id);
+    final actionLabel = providedByStationLibrary
+        ? '已由站点库提供'
+        : installed == null
         ? '安装'
         : isNewer
         ? '更新'
@@ -1403,7 +1415,10 @@ class IdjPluginTabState extends State<IdjPluginTab> {
             width: double.infinity,
             child: FilledButton.tonal(
               key: ValueKey('idj-sub-install-${plugin.id}'),
-              onPressed: installing || installed != null && !isNewer
+              onPressed:
+                  installing ||
+                      providedByStationLibrary ||
+                      installed != null && !isNewer
                   ? null
                   : () => _installSubscriptionPlugin(plugin),
               style: FilledButton.styleFrom(

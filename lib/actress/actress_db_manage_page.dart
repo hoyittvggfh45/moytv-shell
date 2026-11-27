@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:path/path.dart' as path;
 
+import '../content_registry.dart';
+import '../station_library.dart';
 import 'actress_db_export.dart';
 import 'actress_db_info.dart';
 import 'actress_db_meta.dart';
@@ -46,6 +48,11 @@ class ActressDbManagePage extends StatefulWidget {
     this.pickSqlFile,
     this.pickTableFile,
     this.magnetStoreOpener,
+    this.stationStatusLoader,
+    this.stationMetaLoader,
+    this.stationImportStarter,
+    this.stationDeleter,
+    this.stationRestorer,
   });
 
   /// 内部工作库路径。
@@ -70,6 +77,15 @@ class ActressDbManagePage extends StatefulWidget {
   final Future<MagnetLibraryStore> Function(String dbPath)?
   magnetStoreOpener;
 
+  // 站点库区接缝（测试用假实现，生产走 StationLibrary 默认）。
+  final Future<({bool imported, int itemCount, bool backupExists})>
+  Function()?
+  stationStatusLoader;
+  final Future<StationLibraryImportMeta?> Function()? stationMetaLoader;
+  final Future<StationLibraryImportResult> Function()? stationImportStarter;
+  final Future<void> Function()? stationDeleter;
+  final Future<StationLibraryImportResult> Function()? stationRestorer;
+
   @override
   State<ActressDbManagePage> createState() => _ActressDbManagePageState();
 }
@@ -85,6 +101,14 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
 
   /// 已并存导入的磁力分类库（删库入口在这里，见磁力分类库区）。
   var _magnetLibraries = const <MagnetLibraryRecord>[];
+
+  /// 站点库区状态（独立槽，与女优库/磁力库互不影响）。
+  var _stationImported = false;
+  var _stationCount = 0;
+  var _stationBackup = false;
+  StationLibraryImportMeta? _stationMeta;
+  var _stationBusy = false;
+  String? _stationResult;
 
   /// MYTV 文件夹是否绑定成功（导出大文件可复制到那里拿走；
   /// 绑定结果由列表页启动时解析并缓存，这里只读缓存口径）。
@@ -120,6 +144,7 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
       if (info.exists) {
         magnetLibraries = await _loadMagnetLibraries();
       }
+      await _refreshStation();
       if (!mounted) return;
       setState(() {
         _info = info;
@@ -133,6 +158,136 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
     } catch (_) {
       if (!mounted) return;
       setState(() => _loadingInfo = false);
+    }
+  }
+
+  Future<({bool imported, int itemCount, bool backupExists})>
+  _defaultStationStatus() async {
+    await StationLibrary.ensureLoaded();
+    return (
+      imported: StationLibrary.isImported,
+      itemCount: StationLibrary.itemCount,
+      backupExists: await StationLibrary.backupExists(),
+    );
+  }
+
+  Future<void> _refreshStation() async {
+    try {
+      final status = await (widget.stationStatusLoader ??
+          _defaultStationStatus)();
+      final meta = await (widget.stationMetaLoader ??
+          loadStationImportMeta)();
+      if (!mounted) return;
+      _stationImported = status.imported;
+      _stationCount = status.itemCount;
+      _stationBackup = status.backupExists;
+      _stationMeta = meta;
+    } catch (_) {
+      // 站点库状态读不到按未导入显示，不拖垮整页刷新。
+    }
+  }
+
+  Future<StationLibraryImportResult> _defaultStationImport() async {
+    final core = await StationLibrary.currentCoreVersion();
+    return StationLibrary.pickAndImport(
+      manifestIds: ContentRegistry.stationLibraryManifestIds,
+      currentCoreVersion: core,
+    );
+  }
+
+  Future<StationLibraryImportResult> _defaultStationRestore() async {
+    final core = await StationLibrary.currentCoreVersion();
+    return StationLibrary.restoreBackup(
+      manifestIds: ContentRegistry.stationLibraryManifestIds,
+      currentCoreVersion: core,
+    );
+  }
+
+  Future<void> _importStationLibrary() async {
+    if (_controller.busy || _acting || _stationBusy) return;
+    setState(() {
+      _stationBusy = true;
+      _stationResult = null;
+    });
+    try {
+      final result = await (widget.stationImportStarter ??
+          _defaultStationImport)();
+      if (!mounted) return;
+      setState(() {
+        _stationResult = result.ok
+            ? '已导入站点库：共 ${result.itemCount} 条'
+                  '（阅读书源 + 听书蜘蛛），名单里的站现在可以用了'
+            : result.cancelled
+            ? null
+            : '导入失败：${result.error ?? '未知原因'}';
+      });
+      if (result.ok) _snack('站点库已导入');
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _stationResult = '导入失败：${e.toString().split('\n').first}';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _stationBusy = false);
+      _refresh();
+    }
+  }
+
+  Future<void> _deleteStationLibrary() async {
+    if (_controller.busy || _acting || _stationBusy) return;
+    final ok = await _confirm(
+      title: '删除站点库？',
+      body: '删完阅读区的内置书源与听书区的内置蜘蛛就只剩名单、'
+          '点不开了，要重新导入站点库才能用。\n'
+          '女优库与磁力分类库不受影响，备份也会一并删掉。',
+      action: '删除',
+    );
+    if (!ok) return;
+    setState(() => _stationBusy = true);
+    try {
+      await (widget.stationDeleter ?? StationLibrary.deleteLibrary)();
+      _snack('已删除站点库，名单里的站回到未导入状态');
+    } catch (e) {
+      _snack('删除失败：${e.toString().split('\n').first}');
+    } finally {
+      if (mounted) setState(() => _stationBusy = false);
+      _refresh();
+    }
+  }
+
+  Future<void> _restoreStationBackup() async {
+    if (_controller.busy || _acting || _stationBusy) return;
+    final ok = await _confirm(
+      title: '回退上一版站点库？',
+      body: '把上次导入时留下的上一版站点库顶回来，'
+          '现在的站点库会被换掉。回退前会先验一遍，验不过不动。',
+      action: '回退',
+    );
+    if (!ok) return;
+    setState(() {
+      _stationBusy = true;
+      _stationResult = null;
+    });
+    try {
+      final result = await (widget.stationRestorer ??
+          _defaultStationRestore)();
+      if (!mounted) return;
+      setState(() {
+        _stationResult = result.ok
+            ? '已回退到上一版站点库：共 ${result.itemCount} 条'
+            : '回退失败：${result.error ?? '未知原因'}';
+      });
+      if (result.ok) _snack('已回退上一版站点库');
+    } catch (e) {
+      if (mounted) {
+        setState(() {
+          _stationResult = '回退失败：${e.toString().split('\n').first}';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _stationBusy = false);
+      _refresh();
     }
   }
 
@@ -668,6 +823,75 @@ class _ActressDbManagePageState extends State<ActressDbManagePage> {
                       : () => _deleteMagnetLibrary(record),
                 ),
               ),
+          const SizedBox(height: 20),
+          _sectionTitle(textStyle, '站点库'),
+          if (_stationImported)
+            Text(
+              '已导入站点库：共 $_stationCount 条（阅读书源 + 听书蜘蛛）'
+              '${_stationMeta == null ? '' : '\n最近一次导入：${_formatTime(_stationMeta!.importedAt)} · 来源 ${_stationMeta!.sourceName.isEmpty ? '未知' : _stationMeta!.sourceName}${_stationMeta!.libraryVersion.isEmpty ? '' : ' · 库版本 ${_stationMeta!.libraryVersion}'}${_stationMeta!.requiredCoreLabel.isEmpty ? '' : ' · 要求 App 版本 ${_stationMeta!.requiredCoreLabel} 或更高'}'}',
+              style: textStyle.bodyMedium,
+            )
+          else
+            Text(
+              '还没有导入站点库。\n阅读区的内置书源与听书区的内置蜘蛛'
+              '现在只有名单、点不开；导入「魔蚁站点.sql」后才能用。',
+              style: textStyle.bodyMedium?.copyWith(
+                color: colors.onSurfaceVariant,
+              ),
+            ),
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              '说明：片库的 jar 站第一期不在站点库范围内，没导入也能用；'
+              '红果、听书网、懒人听书、番茄音乐是原生站，同样不受影响。'
+              '站点库是独立的一份，删除它不动女优库与磁力分类库。',
+              style: textStyle.bodySmall?.copyWith(
+                color: colors.onSurfaceVariant,
+              ),
+            ),
+          ),
+          _actionRow(
+            colors: colors,
+            textStyle: textStyle,
+            title: _stationImported ? '重新导入站点库' : '导入站点库',
+            subtitle: '选「魔蚁站点.sql」导入：先全量校验（含整库签名），'
+                '全过才换上，旧的留一份可回退',
+            buttonText: '导入',
+            onPressed: _controller.busy || _acting || _stationBusy
+                ? null
+                : _importStationLibrary,
+          ),
+          if (_stationBusy)
+            const Padding(
+              padding: EdgeInsets.symmetric(vertical: 6),
+              child: LinearProgressIndicator(),
+            ),
+          if (_stationResult != null)
+            _resultText(colors, textStyle, _stationResult!),
+          if (_stationBackup)
+            _actionRow(
+              colors: colors,
+              textStyle: textStyle,
+              title: '回退上一版站点库',
+              subtitle: '上次导入时留下的上一版还在，验过才顶回来',
+              buttonText: '回退',
+              onPressed: _controller.busy || _acting || _stationBusy
+                  ? null
+                  : _restoreStationBackup,
+            ),
+          if (_stationImported)
+            _actionRow(
+              colors: colors,
+              textStyle: textStyle,
+              title: '删除站点库',
+              subtitle: '删完名单里的站回到未导入状态（只有名单、点不开），'
+                  '女优库与磁力分类库不受影响',
+              buttonText: '删除',
+              danger: true,
+              onPressed: _controller.busy || _acting || _stationBusy
+                  ? null
+                  : _deleteStationLibrary,
+            ),
           const SizedBox(height: 20),
           _sectionTitle(textStyle, '导出'),
           _actionRow(

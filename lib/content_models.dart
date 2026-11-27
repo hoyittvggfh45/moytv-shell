@@ -92,6 +92,12 @@ abstract class ContentSource {
   ContentSection get section;
   String get note => '';
 
+  /// 是否归站点库管（代码装在「魔蚁站点.sql」里走导入激活）：
+  /// 这类源没导入站点库时只有名单行、点不开，数据层取数一律
+  /// 先过 StationLibrary。默认不管；JsonContentSource 与
+  /// PyContentSource 按资产前缀判定（外部导入的源不归它管）。
+  bool get stationGated => false;
+
   Future<List<ContentCategory>> categories();
   Future<ContentPage> catalog(String categoryId, int page);
   Future<ContentPage> search(String keyword, int page);
