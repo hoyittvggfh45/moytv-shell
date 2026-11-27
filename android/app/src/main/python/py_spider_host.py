@@ -1174,6 +1174,16 @@ def _dispatch(spider, request):
         return bool(spider.manualVideoCheck())
     if action == "action":
         return spider.action(str(request.get("name") or ""))
+    if action == "webFetchResult":
+        # webFetch declarative two-stage resume: the shell fetched the
+        # rendered HTML for the marker the spider returned; hand it back
+        # to the spider's optional webFetchResult(html, ctx) method.
+        fn = getattr(spider, "webFetchResult", None)
+        if not callable(fn):
+            raise ValueError("spider does not define webFetchResult")
+        ctx = request.get("ctx") or {}
+        result = _call_arity(fn, (str(request.get("html") or ""), ctx))
+        return result if isinstance(result, dict) else {"list": result}
     if action == "catalog":
         query = str(request.get("query") or "").strip()
         page = _norm_pg(request.get("page") or 1)
@@ -1253,6 +1263,7 @@ _ACTION_METHODS = {
     "format": "isVideoFormat",
     "check": "manualVideoCheck",
     "action": "action",
+    "webFetchResult": "webFetchResult",
     "detail": "detailContent",
     "search": "searchContent",
     "resolve": "playerContent",

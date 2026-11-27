@@ -155,6 +155,10 @@ type nativeInput struct {
 	PluginID string `json:"pluginId"`
 	Fn       string `json:"fn"`
 	Args     string `json:"args"`
+	// jsSpider webFetch 续接入参（command=webFetchResult 时用）：
+	// 壳侧 WebFetchService 取回的渲染 HTML 与源透传 ctx（JSON 串）。
+	WebFetchHTML string `json:"webFetchHtml"`
+	WebFetchCtx  string `json:"webFetchCtx"`
 	// 红果账号/登录动作入参（hongguoAccount* / hongguoLogin*）。
 	Phone         string `json:"phone"`
 	Code          string `json:"code"`

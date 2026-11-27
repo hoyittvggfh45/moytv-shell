@@ -41,6 +41,7 @@ import 'cloud_drive/cloud_115_offline.dart';
 import 'cloud_drive/cloud_credential_store.dart';
 import 'cloud_drive/cloud_drive_engine.dart';
 import 'catalog_updates.dart';
+import 'web_fetch_service.dart';
 import 'download_collections.dart';
 import 'resource_settings.dart';
 import 'source_fanout.dart';
@@ -910,19 +911,40 @@ class NativeRepository extends AppRepository {
     _authorize(source);
     final bundle = await _idjBundle(source);
     final store = IdjPluginStore();
-    try {
+    Future<Map<String, dynamic>> callOnce(
+      String fnName,
+      Map<String, dynamic> fnArgs,
+    ) async {
       final result = await _call({
         'action': 'idjCall',
         'pluginId': bundle.manifest.id,
         'content': bundle.script,
         'manifest': jsonEncode(bundle.manifest.raw),
-        'fn': fn,
-        'args': jsonEncode(args),
+        'fn': fnName,
+        'args': jsonEncode(fnArgs),
       });
-      await store.recordSuccess(bundle.manifest.id);
       final inner = result['result'];
       if (inner is Map) return Map<String, dynamic>.from(inner);
       return {};
+    }
+
+    try {
+      final first = await callOnce(fn, args);
+      // webFetch 声明式两段：插件结果带标记时壳侧取渲染 HTML，
+      // 再以 fn=webFetchResult 续接（插件未提供该函数由 Go 侧回错）。
+      final out = await runWithWebFetch(
+        first,
+        (resume) => callOnce('webFetchResult', {
+          'html': resume['html'],
+          'url': resume['url'],
+          'ctx': resume['ctx'],
+          'ok': resume['ok'],
+          'error': resume['error'],
+          'evalResult': resume['evalResult'],
+        }),
+      );
+      await store.recordSuccess(bundle.manifest.id);
+      return out;
     } catch (error) {
       await store.recordFailure(
         bundle.manifest.id,
@@ -1064,27 +1086,49 @@ class NativeRepository extends AppRepository {
   }) async {
     _authorize(source);
     final script = await _jsSpiderScript(source);
-    final result = await _call({
-      'action': 'jsSpider',
-      'content': script,
-      'command': operation,
-      'category': category,
-      'page': page,
-      'query': query,
-      'drama': {
-        'id': vodId,
-        'source': source,
-        'sourceId': vodId,
-        'title': '',
-        'description': '',
-        'cover': '',
-      },
-      'flag': flag,
-      'playId': playId,
-    });
-    final inner = result['result'];
-    if (inner is Map) return Map<String, dynamic>.from(inner);
-    return {};
+    Future<Map<String, dynamic>> callOp(
+      String op, {
+      String webFetchHtml = '',
+      Map<String, dynamic> webFetchCtx = const {},
+    }) async {
+      final result = await _call({
+        'action': 'jsSpider',
+        'content': script,
+        'command': op,
+        'category': category,
+        'page': page,
+        'query': query,
+        'drama': {
+          'id': vodId,
+          'source': source,
+          'sourceId': vodId,
+          'title': '',
+          'description': '',
+          'cover': '',
+        },
+        'flag': flag,
+        'playId': playId,
+        if (op == 'webFetchResult') 'webFetchHtml': webFetchHtml,
+        if (op == 'webFetchResult') 'webFetchCtx': jsonEncode(webFetchCtx),
+      });
+      final inner = result['result'];
+      if (inner is Map) return Map<String, dynamic>.from(inner);
+      return {};
+    }
+
+    final first = await callOp(operation);
+    // webFetch 声明式两段：脚本结果带标记时壳侧取渲染 HTML，
+    // 再以 command=webFetchResult 续接脚本的同名全局函数。
+    return runWithWebFetch(
+      first,
+      (resume) => callOp(
+        'webFetchResult',
+        webFetchHtml: '${resume['html'] ?? ''}',
+        webFetchCtx: resume['ctx'] is Map
+            ? Map<String, dynamic>.from(resume['ctx'] as Map)
+            : const {},
+      ),
+    );
   }
 
   Future<String> _pySpiderPath(String source) async {
@@ -1119,12 +1163,31 @@ class NativeRepository extends AppRepository {
     _authorize(source);
     final path = await _pySpiderPath(source);
     final ext = SourceSite.importedSites[source]?.importExt ?? '';
-    final payload = {
-      ...request,
-      if (ext.isNotEmpty) 'extend': ext,
-      'cfDisguise': access?.pythonCfDisguise ?? true,
-    };
-    return PyBridge.call(path, payload);
+    Future<Map<String, dynamic>> callWith(Map<String, dynamic> req) {
+      final payload = {
+        ...req,
+        if (ext.isNotEmpty) 'extend': ext,
+        'cfDisguise': access?.pythonCfDisguise ?? true,
+      };
+      return PyBridge.call(path, payload);
+    }
+
+    final first = await callWith(request);
+    // webFetch 声明式两段：蜘蛛结果带标记时壳侧取渲染 HTML，
+    // 再以 action=webFetchResult 续接蜘蛛的同名可选方法
+    //（宿主分发见 py_spider_host.py，未定义该方法回明确错误）。
+    return runWithWebFetch(
+      first,
+      (resume) => callWith({
+        'action': 'webFetchResult',
+        'html': resume['html'],
+        'url': resume['url'],
+        'ctx': resume['ctx'],
+        'ok': resume['ok'],
+        'error': resume['error'],
+        'evalResult': resume['evalResult'],
+      }),
+    );
   }
 
   Future<dynamic> _pyCallRaw(

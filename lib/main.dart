@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'core_bridge.dart';
+import 'web_fetch_host.dart';
 import 'actress/actress_mytv_bind.dart';
 import 'app_update.dart';
 import 'app_layout.dart';
@@ -328,7 +329,11 @@ class _MoyiAppState extends State<MoyiApp> {
         final mode = store?.displayMode ?? 'auto';
         final tv = mode == 'television' || mode == 'auto' && widget.television;
         final theme = Theme.of(context);
-        return AnnotatedRegion<SystemUiOverlayStyle>(
+        // WebFetchHost：全壳共用隐藏浏览器取数服务的根槽位（懒挂载，
+        // 无取数任务时不占任何控件/内存），py/JS 源的 webFetch 声明
+        // 由它执行。见 web_fetch_service.dart。
+        return WebFetchHost(
+          child: AnnotatedRegion<SystemUiOverlayStyle>(
           value: AppTheme.systemBars(theme.brightness),
           child: AppThemeBackground(
             child: AppOrientationScope(
@@ -358,6 +363,7 @@ class _MoyiAppState extends State<MoyiApp> {
                 ),
               ),
             ),
+          ),
           ),
         );
       },

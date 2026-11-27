@@ -1020,7 +1020,65 @@ func jsSpiderPage(input nativeInput) (int, error) {
 	return 1, nil
 }
 
+// jsSpiderWebFetchResult 是 webFetch 声明式两段调用的续接：壳侧
+// WebFetchService 已把标记页面的渲染 HTML 取回，这里把
+// (html, ctx) 喂给脚本的全局 webFetchResult 函数，产出形状与
+// jsSpiderRunArgs 同口径（字符串 JSON 解包、数组包 list）。
+func jsSpiderWebFetchResult(script, html, ctxJSON string) (map[string]interface{}, error) {
+	ctx := &jsSpiderCtx{client: jsSpiderHTTPClient()}
+	rt := ctx.runtime()
+	script = jsStripModuleSyntax(script).script
+	if _, err := rt.RunString(script); err != nil {
+		return nil, err
+	}
+	fn, found := jsFindFunction(rt, "webFetchResult")
+	if !found {
+		return nil, errors.New("JS spider does not provide webFetchResult")
+	}
+	var ctxValue interface{} = map[string]interface{}{}
+	if strings.TrimSpace(ctxJSON) != "" {
+		var parsed interface{}
+		if err := json.Unmarshal([]byte(ctxJSON), &parsed); err == nil {
+			ctxValue = parsed
+		}
+	}
+	out, err := fn(goja.Undefined(), rt.ToValue(html), rt.ToValue(ctxValue))
+	if err != nil {
+		return nil, err
+	}
+	if (out == nil || goja.IsUndefined(out)) && ctx.resultSet {
+		out = ctx.result
+	}
+	decoded, err := jsExportValue(rt, out)
+	if err != nil {
+		return nil, err
+	}
+	if text, ok := decoded.(string); ok {
+		trimmed := strings.TrimSpace(text)
+		if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
+			var parsed interface{}
+			if err := json.Unmarshal([]byte(trimmed), &parsed); err == nil {
+				decoded = parsed
+			} else {
+				return nil, errors.New("JS spider returned invalid JSON text")
+			}
+		} else {
+			return nil, errors.New("JS spider returned plain text instead of a result object")
+		}
+	}
+	if list, ok := decoded.([]interface{}); ok {
+		return map[string]interface{}{"list": list}, nil
+	}
+	if result, ok := decoded.(map[string]interface{}); ok {
+		return result, nil
+	}
+	return nil, errors.New("JS spider returned an unsupported result shape")
+}
+
 func jsSpiderDispatch(input nativeInput) (map[string]interface{}, error) {
+	if input.Command == "webFetchResult" {
+		return jsSpiderWebFetchResult(input.Content, input.WebFetchHTML, input.WebFetchCtx)
+	}
 	page, _ := jsSpiderPage(input)
 	vodID := input.Drama.SourceID
 	if vodID == "" {
