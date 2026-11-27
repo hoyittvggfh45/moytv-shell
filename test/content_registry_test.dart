@@ -5,70 +5,34 @@ import 'package:flutter_test/flutter_test.dart';
 
 void main() {
   group('内容注册表清单', () {
-    test('听书：听书网、喜马拉雅、红果听书、懒人听书', () {
+    test('听书：空壳只剩原生听书网、懒人听书（py 蜘蛛与飞卢已剥离）', () {
       expect(
         ContentRegistry.sourcesFor(ContentSection.audio).map((s) => s.id),
         [
           'tingshuwang',
-          'ximalaya',
-          'hongguo_audio',
           'lrts',
-          'hsvoice31',
-          'tingyou',
-          'bilibili',
-          'yuntu',
-          'shuyinfm',
-          'bookan',
-          'hysxs',
-          'asmrmoon',
-          'asmrhoney',
-          'jar_tingshu',
         ],
       );
       expect(
         ContentRegistry.sourcesFor(ContentSection.audio).map((s) => s.name),
         [
           '听书网',
-          '喜马拉雅',
-          '红果听书',
           '懒人听书',
-          '🔞黄色有声小说',
-          '听友听书',
-          '哔哩哔哩听书',
-          '云图听书',
-          '书音FM',
-          '博看听书',
-          '🔞H有声小说',
-          '🔞ASMR MOON',
-          '🔞ASMRHoney',
-          '飞卢听书',
         ],
       );
     });
 
-    test('听书：成人源也在列，不再有午夜门禁', () {
+    test('听书：空壳无 py 成人源在列', () {
       expect(
         ContentRegistry.sourcesFor(ContentSection.audio).map((s) => s.id),
         [
           'tingshuwang',
-          'ximalaya',
-          'hongguo_audio',
           'lrts',
-          'hsvoice31',
-          'tingyou',
-          'bilibili',
-          'yuntu',
-          'shuyinfm',
-          'bookan',
-          'hysxs',
-          'asmrmoon',
-          'asmrhoney',
-          'jar_tingshu',
         ],
       );
       expect(
         ContentRegistry.sourcesFor(ContentSection.audio).last.name,
-        '飞卢听书',
+        '懒人听书',
       );
     });
 
@@ -106,19 +70,7 @@ void main() {
         ContentRegistry.sourcesFor(ContentSection.audio).map((s) => s.id),
         [
           'tingshuwang',
-          'ximalaya',
-          'hongguo_audio',
           'lrts',
-          'hsvoice31',
-          'tingyou',
-          'bilibili',
-          'yuntu',
-          'shuyinfm',
-          'bookan',
-          'hysxs',
-          'asmrmoon',
-          'asmrhoney',
-          'jar_tingshu',
         ],
       );
     });

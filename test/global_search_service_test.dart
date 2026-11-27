@@ -99,7 +99,7 @@ class _CountingSource extends _FakeSource {
 }
 
 void main() {
-  test('收齐两区：听书 14 个 + 阅读 128 个，id 唯一，成人源也在列', () {
+  test('收齐两区：听书 2 个 + 阅读 128 个，id 唯一', () {
     addTearDown(() => ContentRegistry.setNovelImports([]));
     ContentRegistry.setNovelImports([]);
     final targets = globalSearchBookTargets(
@@ -114,21 +114,11 @@ void main() {
         .where((t) => t.section == ContentSection.novel)
         .map((t) => t.source.id)
         .toList();
+    // 空壳版（2026-11-28 发版口径）：听读 py 蜘蛛与飞卢 jar 已
+    // 剥离，听书只剩原生听书网、懒人听书两源。
     expect(audio, [
       'tingshuwang',
-      'ximalaya',
-      'hongguo_audio',
       'lrts',
-      'hsvoice31',
-      'tingyou',
-      'bilibili',
-      'yuntu',
-      'shuyinfm',
-      'bookan',
-      'hysxs',
-      'asmrmoon',
-      'asmrhoney',
-      'jar_tingshu',
     ]);
     // 阅读 128 = 27 py + 101 内置 JSON 书源（2026-11-27 探针实测；
     // 此前写死的 71 是旧批次攒下的存量旧数，与本次听书 +1 无关）。
@@ -141,11 +131,9 @@ void main() {
       novel,
       containsAll(ContentRegistry.novelJsonBuiltins.map((s) => s.id)),
     );
-    // 无门禁：成人源 id 都在列；全表 id 不重复。
-    // 听书 14 个 + 阅读 128 个（2026-11-27 探针实测），id 无重叠，
-    // 去重后 142。（分区内置批听书 +ASMRHoney：13 → 14；阅读数与
-    // 总数此前写死的 73/86 均为存量旧数，本次按实测一并订正。）
-    expect(targets.map((t) => t.source.id).toSet().length, 142);
+    // 全表 id 不重复：听书 2 个 + 阅读 128 个，id 无重叠，
+    // 去重后 130（空壳剥离口径，2026-11-28 实测订正）。
+    expect(targets.map((t) => t.source.id).toSet().length, 130);
   });
 
   test('去重：同 id 两区都出现只留一个，听书优先', () {
@@ -185,13 +173,15 @@ void main() {
     expect(comics.every((t) => t.section == ContentSection.novel), isTrue);
   });
 
-  test('hongguo 不撞名：阅读侧只有 hongguo_audio，没有裸 hongguo', () {
+  test('hongguo 不撞名：空壳听读已剥离，无 hongguo_audio 也无裸 hongguo', () {
     final targets = globalSearchBookTargets(
       audioSources: ContentRegistry.sourcesFor(ContentSection.audio),
       novelSources: ContentRegistry.sourcesFor(ContentSection.novel),
     );
     final ids = targets.map((t) => t.source.id).toSet();
-    expect(ids, contains('hongguo_audio'));
+    // 空壳版红果听书 py 已剥离：hongguo_audio 不在列；裸 hongguo
+    // 是影视侧源、从来不在听读/阅读目标里，同样不在列。
+    expect(ids, isNot(contains('hongguo_audio')));
     expect(ids, isNot(contains('hongguo')));
   });
 

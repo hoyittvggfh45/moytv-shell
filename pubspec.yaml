@@ -1,7 +1,7 @@
 name: moyi
 description: 独立运行的多端短剧应用
 publish_to: none
-version: 2026.11.27+4
+version: 2026.11.27-1+5
 
 environment:
   sdk: '>=3.12.0 <4.0.0'
@@ -59,10 +59,8 @@ flutter:
     - assets/video_enhancement/
     - assets/live/
     - assets/live/m3u/
-    - assets/audio_spiders/
     - assets/novel_spiders/
     - assets/legado_sources/
-    - assets/jars/zakatv.jar
     - assets/haikuo_samples.json
     - assets/haikuo_builtin_rules.json
     - assets/haikuo_modules/

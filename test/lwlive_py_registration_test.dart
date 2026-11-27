@@ -64,20 +64,8 @@ void main() {
     expect(zakatvBuiltinSites.any((s) => s.key == 'duoduo'), isFalse);
   });
 
-  test('ASMR MOON：听书区注册值与蜘蛛文件齐全', () {
-    final sources = ContentRegistry.sourcesFor(ContentSection.audio);
-    final matches = [for (final s in sources) if (s.id == 'asmrmoon') s];
-    expect(matches, hasLength(1));
-    final source = matches.single;
-    expect(source.name, '🔞ASMR MOON');
-    expect(source.section, ContentSection.audio);
-    expect(source, isA<PyContentSource>());
-    expect(
-      (source as PyContentSource).assetPath,
-      'assets/audio_spiders/asmrmoon.py',
-    );
-    _expectSpiderProtocol('assets/audio_spiders/asmrmoon.py');
-  });
+  // 空壳版（2026-11-28 发版口径）：ASMR MOON 听读 py 已剥离，
+  // 「注册值与蜘蛛文件齐全」一条随剥离删除；id 不撞核心站一条保留。
 
   test('ASMR MOON：id 不与核心站撞', () {
     expect(SourceSite.isKnown('asmrmoon'), isFalse);

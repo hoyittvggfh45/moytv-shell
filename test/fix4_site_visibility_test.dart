@@ -22,21 +22,11 @@ void main() {
   });
 
   test('audio zone exposes its built-in source for management', () {
+    // 空壳版（2026-11-28 发版口径）：听读 py 与飞卢 jar 已剥离，
+    // 听书区只剩原生两源。
     expect(ContentRegistry.sourcesFor(ContentSection.audio).map((s) => s.id), [
       'tingshuwang',
-      'ximalaya',
-      'hongguo_audio',
       'lrts',
-      'hsvoice31',
-      'tingyou',
-      'bilibili',
-      'yuntu',
-      'shuyinfm',
-      'bookan',
-      'hysxs',
-      'asmrmoon',
-      'asmrhoney',
-      'jar_tingshu',
     ]);
   });
 

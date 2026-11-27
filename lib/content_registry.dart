@@ -2,7 +2,6 @@ import 'builtin_legado_sources.dart';
 import 'content_audio.dart';
 import 'content_fanqie_music.dart';
 import 'content_http.dart';
-import 'content_jar_audio.dart';
 import 'content_lrts.dart';
 import 'content_models.dart';
 import 'content_py.dart';
@@ -14,69 +13,7 @@ class ContentRegistry {
 
   static final List<ContentSource> _sources = [
     TingshuwangSource(_http),
-    PyContentSource(
-      id: 'ximalaya',
-      name: '喜马拉雅',
-      assetPath: 'assets/audio_spiders/ximalaya.py',
-    ),
-    PyContentSource(
-      id: 'hongguo_audio',
-      name: '红果听书',
-      assetPath: 'assets/audio_spiders/hongguo.py',
-      fixedCategoryId: 'audio',
-      fixedCategoryName: '听书',
-      filterKey: 'acat',
-    ),
     LrtsSource(_http),
-    PyContentSource(
-      id: 'hsvoice31',
-      name: '🔞黄色有声小说',
-      assetPath: 'assets/audio_spiders/hsvoice31.py',
-    ),
-    PyContentSource(
-      id: 'tingyou',
-      name: '听友听书',
-      assetPath: 'assets/audio_spiders/tingyou.py',
-    ),
-    PyContentSource(
-      id: 'bilibili',
-      name: '哔哩哔哩听书',
-      assetPath: 'assets/audio_spiders/bilibili.py',
-    ),
-    PyContentSource(
-      id: 'yuntu',
-      name: '云图听书',
-      assetPath: 'assets/audio_spiders/yuntu.py',
-    ),
-    PyContentSource(
-      id: 'shuyinfm',
-      name: '书音FM',
-      assetPath: 'assets/audio_spiders/shuyinfm.py',
-    ),
-    PyContentSource(
-      id: 'bookan',
-      name: '博看听书',
-      assetPath: 'assets/audio_spiders/bookan.py',
-    ),
-    PyContentSource(
-      id: 'hysxs',
-      name: '🔞H有声小说',
-      assetPath: 'assets/audio_spiders/hysxs.py',
-    ),
-    PyContentSource(
-      id: 'asmrmoon',
-      name: '🔞ASMR MOON',
-      assetPath: 'assets/audio_spiders/asmrmoon.py',
-    ),
-    // 分区内置批（2026-11-27）：ASMRHoney 音声站，用户 18:58 改令
-    // 「声音站也要」后回到内置清单；听书 py 全链验过（6 分类、
-    // 273 创作者文件夹下钻、专辑多轨），内容含 MP4 视频短片条目。
-    PyContentSource(
-      id: 'asmrhoney',
-      name: '🔞ASMRHoney',
-      assetPath: 'assets/audio_spiders/asmrhoney.py',
-    ),
-    JarAudioContentSource(),
     FanqieMusicSource(_http),
   ];
 
@@ -262,10 +199,29 @@ class ContentRegistry {
   /// 认这份集合——库里出现集合外的站整单拒收。构成与生成器
   /// gen_station_sql.py 的取数口径一致：全部内置 legado 书源
   /// （101）+ 听读 py 蜘蛛（11）。
+  // 空壳版（2026-11-28 发版口径）：听读 py 登记已随资产剥离，但
+  // 站点库名单口径不随登记走——官方「魔蚁站点.sql」在空壳里也要
+  // 能整库验过（legado 101 条导入后在阅读区生效；听读 py 11 条
+  // 只验不激活，空壳听读区不因导入站点库长出内置源）。
+  static const Set<String> _shellStationAudioPyIds = {
+    'ximalaya',
+    'hongguo_audio',
+    'hsvoice31',
+    'tingyou',
+    'bilibili',
+    'yuntu',
+    'shuyinfm',
+    'bookan',
+    'hysxs',
+    'asmrmoon',
+    'asmrhoney',
+  };
+
   static Set<String> get stationLibraryManifestIds => {
     for (final source in novelJsonBuiltins) source.id,
     for (final source in _sources)
       if (source is PyContentSource && source.stationGated) source.id,
+    ..._shellStationAudioPyIds,
   };
 
   static Set<String> get hiddenLegadoIds => Set.unmodifiable(_hiddenLegadoIds);
