@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:enough_convert/gbk.dart';
 import 'package:sqflite/sqflite.dart';
 
 import 'actress_generic_db.dart';
@@ -281,6 +282,70 @@ class SqfliteImportExecutor implements SqlImportExecutor {
 /// “已取消，数据库未改动”收尾。
 class ActressSqlImportCancelled implements Exception {}
 
+/// .sql 的文本编码（2026-11-28 用户手机实报修）。
+///
+/// 用户的整库 .sql 是在电脑上导出的，Windows 侧的工具按本地代码页
+/// 输出，中文标题/番号是 GBK 双字节；导入器原来一律按严格 UTF-8
+/// 解码，读到第一个中文字节就整单炸：
+/// `FormatException: Unexpected extension byte (at offset 61440)`。
+/// 现在导入前先判编码：整份字节流是合法 UTF-8 就照旧走 UTF-8，
+/// 只要出现一处非法序列就按 GBK 解（ASCII 在两种编码里字节相同，
+/// 所以 SQL 关键字、番号、地址不受影响）。
+enum SqlTextEncoding { utf8, gbk }
+
+/// 增量 UTF-8 合法性校验（只为判编码，不生成字符串）。
+///
+/// 按 DFA 的做法逐字节走：记录还差几个续字节、续字节允许的上下界
+/// （E0 首字节后第一位不许是 80–9F，ED 不许 A0–BF，F0/F4 同理），
+/// 任何一处越界立即判非法并短路。跨块残字节由 [_need] 带入下一块，
+/// 所以分块读和整份读结论一致。
+class _Utf8Validator {
+  int _need = 0;
+  int _lo = 0x80;
+  int _hi = 0xBF;
+
+  bool get valid => _need == 0;
+
+  bool add(List<int> bytes) {
+    for (var i = 0; i < bytes.length; i++) {
+      final b = bytes[i];
+      if (_need > 0) {
+        if (b < _lo || b > _hi) return false;
+        _need--;
+        _lo = 0x80;
+        _hi = 0xBF;
+        continue;
+      }
+      if (b <= 0x7F) continue;
+      if (b >= 0xC2 && b <= 0xDF) {
+        _need = 1;
+      } else if (b == 0xE0) {
+        _need = 2;
+        _lo = 0xA0;
+      } else if (b >= 0xE1 && b <= 0xEC) {
+        _need = 2;
+      } else if (b == 0xED) {
+        _need = 2;
+        _hi = 0x9F;
+      } else if (b >= 0xEE && b <= 0xEF) {
+        _need = 2;
+      } else if (b == 0xF0) {
+        _need = 3;
+        _lo = 0x90;
+      } else if (b >= 0xF1 && b <= 0xF3) {
+        _need = 3;
+      } else if (b == 0xF4) {
+        _need = 3;
+        _hi = 0x8F;
+      } else {
+        // 0x80–0xC1、0xF5–0xFF：UTF-8 里不可能出现的首字节。
+        return false;
+      }
+    }
+    return true;
+  }
+}
+
 /// 女优库 .sql 导入器。
 class ActressSqlImporter {
   ActressSqlImporter({
@@ -313,6 +378,45 @@ class ActressSqlImporter {
   /// [closeDatabase] 只在校验通过、准备换库时才调（关主库连接，
   /// 好让文件改名）。校验不过/取消/执行出错时不调，主库连接还
   /// 在、文件也不动。
+  /// 判 .sql / .sql.gz 的文本编码（见 [SqlTextEncoding]）。
+  ///
+  /// 整份字节流喂给增量 UTF-8 校验器：GBK 文件在第一个中文双字节处
+  /// 就短路（几 KB 判完）；UTF-8 文件必须整份扫一遍才能打包票（坏
+  /// 字节可能出现在很后面），纯字节循环、不进内存、不生成字符串。
+  /// UTF-16（BOM FF FE / FE FF）直接给明确结论——否则按 GBK 解出来
+  /// 是一堆乱码语句，最后报“缺表”，用户看不出真因。
+  static Future<SqlTextEncoding> detectEncoding(
+    File file, {
+    required bool isGz,
+    void Function(String phase)? onPhase,
+  }) async {
+    Stream<List<int>> stream = file.openRead();
+    if (isGz) stream = stream.transform(gzip.decoder);
+    final validator = _Utf8Validator();
+    var scanned = 0;
+    var headerChecked = false;
+    onPhase?.call('正在识别文件编码');
+    await for (final chunk in stream) {
+      if (!headerChecked && chunk.length >= 2) {
+        headerChecked = true;
+        final b0 = chunk[0];
+        final b1 = chunk[1];
+        if ((b0 == 0xFF && b1 == 0xFE) || (b0 == 0xFE && b1 == 0xFF)) {
+          throw StateError(
+            '这个 .sql 是 UTF-16 编码，先在电脑上另存成 UTF-8 再导入',
+          );
+        }
+      }
+      if (!validator.add(chunk)) return SqlTextEncoding.gbk;
+      scanned += chunk.length;
+      if (scanned >= 8 * 1024 * 1024) {
+        scanned = 0;
+        onPhase?.call('正在识别文件编码');
+      }
+    }
+    return validator.valid ? SqlTextEncoding.utf8 : SqlTextEncoding.gbk;
+  }
+
   Future<ActressSqlImportResult> importFile({
     required String sqlPath,
     required String dbPath,
@@ -356,6 +460,21 @@ class ActressSqlImporter {
     SqlImportExecutor? executor;
     var closedDb = false;
     try {
+      // 先判文本编码（2026-11-28 用户手机实报：GBK 的整库 .sql 在
+      // 严格 UTF-8 解码下抛 FormatException，整单导入失败）。放在
+      // 建临时库之前，判不出来就直接给结论，不留临时文件。
+      final textEncoding = await detectEncoding(
+        sqlFile,
+        isGz: isGz,
+        onPhase: (phase) => onProgress(
+          ActressSqlImportProgress(
+            phase: phase,
+            statements: 0,
+            bytesRead: 0,
+            totalBytes: totalBytes,
+          ),
+        ),
+      );
       executor = await _executorFactory(tempPath);
       // .dump 开头自带 PRAGMA foreign_keys=OFF；这里再关一次，
       // 导入中途外键不拦批量写。
@@ -442,14 +561,21 @@ class ActressSqlImporter {
 
       Stream<List<int>> byteStream = sqlFile.openRead();
       if (isGz) byteStream = byteStream.transform(gzip.decoder);
-      final lines = byteStream
-          .map((chunk) {
-            bytesRead += chunk.length;
-            return chunk;
-          })
-          .transform(utf8.decoder)
-          .transform(const LineSplitter());
-      await for (final line in lines) {
+      final counted = byteStream.map((chunk) {
+        bytesRead += chunk.length;
+        return chunk;
+      });
+      // GBK 用 allowInvalid 的宽容解码：个别坏字节顶多成一个替换字符，
+      // 不许因为它把整份可用的库判死（UTF-8 走原来的严格解码）。
+      final textStream = textEncoding == SqlTextEncoding.gbk
+          ? const GbkDecoder(allowInvalid: true).bind(counted)
+          : utf8.decoder.bind(counted);
+      final lines = textStream.transform(const LineSplitter());
+      // UTF-8 BOM 会变成首行行首的 U+FEFF，带着它执行建表语句会失败。
+      var firstLine = true;
+      await for (final rawLine in lines) {
+        final line = firstLine ? rawLine.replaceFirst('\uFEFF', '') : rawLine;
+        firstLine = false;
         checkCancelled();
         for (final statement in splitter.addLine(line)) {
           final head = _statementHead(statement);
